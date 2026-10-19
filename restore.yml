@@ -1,0 +1,268 @@
+---
+# Rebuilds a node's chain state from a published snapshot. Keeps its seed.
+#
+#   ansible-playbook -i inventory.yml restore.yml -l rpc-1 \
+#     -e restore_confirm=rpc-1 \
+#     -e restore_url=https://<explorer>/snapshots/<file>.tar.zst \
+#     -e restore_sha256=<the snapshot's sha256>
+#
+# When to run it: the node wrote a block to disk under rules the network does
+# not follow, and a restart cannot undo that. The usual case is a hard fork
+# rule that reached the node after its PoW height: the node left the network
+# there and carries on alone. The snapshot must be from before that height.
+# A snapshot also saves a fresh host a sync from genesis.
+#
+# What it does: downloads the snapshot and checks its sha256, unpacks it,
+# stops the node, and swaps the season directory's state/ and pos.chain for
+# the snapshot's. The old pair is kept, not deleted. Every other file stays
+# where it is: the seed, and anything else the node keeps there. The node
+# stays stopped. Then run site.yml (with crosslink_mining_hold=true on a
+# miner): it writes the config and starts the node. When the node is at the
+# tip, run site.yml again without it. README.md, "Restore".
+#
+# Not for a finalizer. Nothing on disk records the votes a finalizer cast, so
+# one restored behind the network could vote again at a height it already
+# voted at, for another block. Restore a finalizer by hand, and start it only
+# once the network's BFT height is past the last one it voted at.
+#
+# Every host is named explicitly: restore_confirm must equal the host.
+
+- name: Preflight
+  hosts: all
+  become: false
+  gather_facts: true
+  roles:
+    - preflight
+
+- name: Check the restore is meant
+  hosts: node:miner:finalizer
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Refuse a restore that was not named
+      ansible.builtin.assert:
+        that: (restore_confirm | default('')) == inventory_hostname
+        fail_msg: >-
+          This replaces {{ inventory_hostname }}'s chain state. Name the host
+          to confirm: -e restore_confirm={{ inventory_hostname }}
+        quiet: true
+
+    - name: Refuse a finalizer
+      ansible.builtin.assert:
+        that: inventory_hostname not in (groups['finalizer'] | default([]))
+        fail_msg: >-
+          {{ inventory_hostname }} is a finalizer. Nothing on disk records the
+          votes it cast, so restored behind the network it could vote twice at
+          one height. Restore a finalizer by hand. README.md, "Restore".
+        quiet: true
+
+    - name: Check the snapshot is named
+      ansible.builtin.assert:
+        that:
+          - restore_url | default('') is match('^https://')
+          - restore_sha256 | default('') is match('^[0-9a-fA-F]{64}$')
+        fail_msg: >-
+          Name the snapshot: -e restore_url=https://… -e restore_sha256=<64 hex>.
+          Explorers that publish snapshots list each file's sha256 and the
+          PoW height it was taken at.
+        quiet: true
+
+- name: Restore the node
+  hosts: node:miner:finalizer
+  become: true
+  tags: [node]
+  vars:
+    restore_dir: "{{ crosslink_data_dir | dirname }}/restore"
+    restore_file: "{{ restore_dir }}/{{ restore_url | basename }}"
+    restore_min_free_gb: 25
+    # beside the data directory, not in it: zebrad deletes old state formats there
+    restore_aside: "{{ crosslink_data_dir }}.before-restore-{{ ansible_date_time.iso8601_basic_short }}"
+  tasks:
+    # The same checks reset.yml makes: one seed, found, before anything stops.
+    - name: Find the seed
+      ansible.builtin.shell: >-
+        find {{ crosslink_data_dir | quote }} -maxdepth 3 -name secret.seed -type f 2>/dev/null | head -1
+      register: restore_seed_found
+      changed_when: false
+
+    - name: Count the different seeds
+      ansible.builtin.shell: >-
+        find {{ crosslink_data_dir | quote }} -maxdepth 3 -name secret.seed -type f
+        -exec sha256sum {} + 2>/dev/null | awk '{print $1}' | sort -u | wc -l
+      register: restore_seed_kinds
+      changed_when: false
+
+    - name: Refuse to choose between different seeds
+      ansible.builtin.assert:
+        that: (restore_seed_kinds.stdout | trim | int) <= 1
+        fail_msg: >-
+          {{ crosslink_data_dir }} holds {{ restore_seed_kinds.stdout | trim }}
+          different secret.seed files. Nothing was changed. Keep the one whose
+          fingerprint matches the key bundle, delete the other, and re-run.
+        quiet: true
+
+    - name: Refuse to restore a host whose seed cannot be found
+      ansible.builtin.assert:
+        that: restore_seed_found.stdout | length > 0
+        fail_msg: >-
+          No secret.seed under {{ crosslink_data_dir }}. The node would start
+          with a new identity and a new payout wallet. Put the bundle's seed
+          back first ({{ crosslink_keys_dir }}/{{ inventory_hostname }}), or
+          accept a new identity with -e restore_new_identity=true
+        quiet: true
+      when: not (restore_new_identity | default(false) | bool)
+
+    - name: Read its fingerprint
+      ansible.builtin.shell: sha256sum {{ restore_seed_found.stdout | quote }} | cut -c1-16
+      register: restore_seed_sum
+      changed_when: false
+      when: restore_seed_found.stdout | length > 0
+
+    # The season directory is named in the release. The snapshot must carry
+    # the same one, or the node would start beside it with an empty state.
+    - name: Read the season directory from the source
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        grep -oE '\.push\("[A-Za-z0-9_]+"\)' {{ crosslink_home }}/src/zebra-crosslink/zebrad/src/config.rs
+        | head -1 | sed -E 's/.*"(.*)".*/\1/'
+      args:
+        executable: /bin/bash
+      register: restore_season
+      changed_when: false
+
+    - name: Refuse without a season directory
+      ansible.builtin.assert:
+        that: restore_season.stdout | trim | length > 0
+        fail_msg: >-
+          The season directory name is not in
+          {{ crosslink_home }}/src/zebra-crosslink/zebrad/src/config.rs.
+          Run site.yml first so the source is on the host.
+        quiet: true
+
+    - name: Create the download directory
+      ansible.builtin.file:
+        path: "{{ restore_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    # The download, the unpacked copy and the old state are on disk together.
+    - name: Read the free space
+      ansible.builtin.shell: df -BG --output=avail {{ restore_dir | quote }} | tail -1 | tr -dc 0-9
+      register: restore_free
+      changed_when: false
+
+    - name: Refuse without room
+      ansible.builtin.assert:
+        that: (restore_free.stdout | int) >= (restore_min_free_gb | int)
+        fail_msg: >-
+          {{ restore_dir }} has {{ restore_free.stdout }} GB free. The restore
+          needs about {{ restore_min_free_gb }} GB. Nothing was stopped.
+        quiet: true
+
+    - name: Install zstd
+      ansible.builtin.apt:
+        name: zstd
+        state: present
+
+    # Some hosts refuse a request without a named agent.
+    - name: Download the snapshot
+      ansible.builtin.get_url:
+        url: "{{ restore_url }}"
+        dest: "{{ restore_file }}"
+        checksum: "sha256:{{ restore_sha256 | lower }}"
+        http_agent: crosslink-restore
+        timeout: 120
+        mode: "0640"
+
+    - name: Unpack it beside the state
+      ansible.builtin.shell: >-
+        rm -rf {{ (restore_dir ~ '/unpacked') | quote }} &&
+        mkdir -p {{ (restore_dir ~ '/unpacked') | quote }} &&
+        tar --zstd -xf {{ restore_file | quote }} -C {{ (restore_dir ~ '/unpacked') | quote }}
+      changed_when: true
+
+    - name: Check the snapshot holds this season's state
+      ansible.builtin.stat:
+        path: "{{ restore_dir }}/unpacked/{{ restore_season.stdout | trim }}/{{ item }}"
+      register: restore_parts
+      loop:
+        - state
+        - pos.chain
+
+    - name: Refuse a snapshot for another season
+      ansible.builtin.assert:
+        that: restore_parts.results | selectattr('stat.exists') | list | length == 2
+        fail_msg: >-
+          The snapshot has no {{ restore_season.stdout | trim }}/state and
+          pos.chain. It is for another build or season, or packed another way.
+          Look in {{ restore_dir }}/unpacked. Nothing was stopped.
+        quiet: true
+
+    - name: Stop the stake timer
+      ansible.builtin.systemd_service:
+        name: crosslink-stake.timer
+        state: stopped
+      failed_when: false
+
+    - name: Stop the node
+      ansible.builtin.systemd_service:
+        name: "{{ crosslink_service_name }}"
+        state: stopped
+
+    - name: Create the season directory
+      ansible.builtin.file:
+        path: "{{ crosslink_data_dir }}/{{ restore_season.stdout | trim }}"
+        state: directory
+        owner: "{{ crosslink_user }}"
+        group: "{{ crosslink_user }}"
+        mode: "0750"
+
+    # Kept, not deleted: it is the only record of what the node did on the
+    # branch. Delete it by hand once the node is back at the tip. Same
+    # filesystem, so each move is a rename. non_finalized_state is the node's
+    # copy of its newest blocks, which it commits again at start: left in
+    # place, the branch's blocks would sit beside the snapshot. A snapshot has
+    # none, so the node fetches its newest blocks from its peers.
+    - name: Create the directory for the old state
+      ansible.builtin.file:
+        path: "{{ restore_aside }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Move the old state aside
+      ansible.builtin.shell: >-
+        cd {{ (crosslink_data_dir ~ '/' ~ (restore_season.stdout | trim)) | quote }} &&
+        for p in state pos.chain non_finalized_state; do
+        if [ -e "$p" ]; then mv "$p" {{ restore_aside | quote }}/; fi; done
+      changed_when: true
+
+    - name: Move the snapshot into place
+      ansible.builtin.shell: >-
+        for p in state pos.chain; do
+        mv {{ (restore_dir ~ '/unpacked/' ~ (restore_season.stdout | trim)) | quote }}/"$p"
+        {{ (crosslink_data_dir ~ '/' ~ (restore_season.stdout | trim)) | quote }}/; done
+      changed_when: true
+
+    - name: Give the state to the service user
+      ansible.builtin.file:
+        path: "{{ crosslink_data_dir }}/{{ restore_season.stdout | trim }}"
+        owner: "{{ crosslink_user }}"
+        group: "{{ crosslink_user }}"
+        recurse: true
+
+    - name: Delete the download
+      ansible.builtin.file:
+        path: "{{ restore_dir }}"
+        state: absent
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: state restored from {{ restore_url | basename }}.
+          Seed {{ restore_seed_sum.stdout | default('(new)', true) | trim }} left in place.
+          Old state/ and pos.chain in {{ restore_aside }}.
+          The node is stopped. Next: site.yml -l {{ inventory_hostname }}{{ ' -e crosslink_mining_hold=true' if crosslink_mining_enabled | bool else '' }}.

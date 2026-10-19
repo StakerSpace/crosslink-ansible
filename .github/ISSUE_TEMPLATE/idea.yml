@@ -1,0 +1,21 @@
+name: An idea or a question
+description: A setting the playbook should expose, a check it should make, a doc that is unclear, or a question about running a node with it.
+labels: [question]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: What you want to do, or what you did not understand.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What it would let you do that you cannot today. One line is enough.
+  - type: input
+    id: where
+    attributes:
+      label: Where in the repository
+      placeholder: group_vars/all/main.yml, docs/zebrad-toml.md, crosslink-stake …

@@ -1,0 +1,32 @@
+---
+# The season directory this build keeps its state and its seed in.
+#
+# zebrad appends a season-named directory to `state.cache_dir` at config load
+# and never writes it back (zebrad/src/config.rs, the one `.push("…")` there),
+# so the seed is at <data dir>/<season>/secret.seed. A release that renames it
+# starts the node with no seed there, and zebrad makes a random one: a new
+# finalizer identity and a new payout wallet. The name is read from the source
+# this host is about to run. With no checkout (zebrad_install_mode: copy) it
+# stays unset and the callers say so.
+#
+# Sets crosslink_season (the name) and crosslink_season_seed (the full path),
+# both empty when the source cannot be read.
+
+- name: Read the season directory from the source
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    grep -oE '\.push\("[A-Za-z0-9_]+"\)' {{ crosslink_home }}/src/zebra-crosslink/zebrad/src/config.rs
+    | head -1 | sed -E 's/.*"(.*)".*/\1/'
+  args:
+    executable: /bin/bash
+  register: node_season_read
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Set season facts
+  ansible.builtin.set_fact:
+    crosslink_season: "{{ node_season_read.stdout | default('') | trim }}"
+    crosslink_season_seed: >-
+      {{ (crosslink_data_dir ~ '/' ~ (node_season_read.stdout | trim) ~ '/secret.seed')
+         if (node_season_read.stdout | default('') | trim) else '' }}

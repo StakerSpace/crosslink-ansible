@@ -1,0 +1,19 @@
+# The real inventory holds your hosts and addresses. Only the example is committed.
+inventory*.yml
+!inventory.example.yml
+# Anything vaulted or secret, if you add it
+group_vars/*/secrets.yml
+host_vars/
+# Node key bundles: every node's secret.seed, which on a miner is the key to
+# its rewards and on a finalizer the identity. crosslink_keys_dir defaults
+# outside the repo; this is the safety net for anyone who points it inside.
+crosslink-node-keys/
+**/secret.seed
+**/mnemonic.txt
+**/seed.hex
+NODE-CARD.md
+rewards.json
+# Ansible and Python leftovers
+*.retry
+__pycache__/
+.ansible/

@@ -1,0 +1,404 @@
+---
+# Reads what the node is running and writes a record per host. On a miner it
+# also copies the seed to the control machine: that file can be the only key
+# to the rewards. An RPC node's seed protects nothing, so it stays on the host.
+# Nothing is derived; the node is asked. See README.md, "Key bundle".
+
+- name: Set paths
+  ansible.builtin.set_fact:
+    # the fallback until the node has logged the real path (below)
+    node_seed_path: "{{ crosslink_data_dir }}/secret.seed"
+    node_bundle: "{{ crosslink_keys_dir }}/{{ inventory_hostname }}"
+    # The seed is copied to the control machine when losing it would lose
+    # something: a miner's rewards, or a finalizer's identity (the seed derives
+    # the BFT key, so a lost seed is a finalizer nobody can run and stake
+    # pointing at a key that will never sign again). An RPC node's seed
+    # protects nothing and stays on the host.
+    node_seed_copied: "{{ (crosslink_mining_enabled | bool) or (crosslink_finalizer_enabled | bool) }}"
+
+# ─── Build facts, when the node role did not run (--tags identity) ───────────
+
+- name: Read active binary link
+  ansible.builtin.stat:
+    path: "{{ crosslink_home }}/bin/zebrad"
+  register: node_binary_link
+  when: crosslink_binary is not defined
+
+# as the checkout's owner: git refuses a repository owned by another user
+- name: Read checked-out commit
+  ansible.builtin.command: sudo -u {{ crosslink_user }} git -C {{ crosslink_home }}/src rev-parse HEAD
+  register: node_commit_now
+  changed_when: false
+  failed_when: false
+  when: crosslink_commit is not defined
+
+- name: Set build facts
+  ansible.builtin.set_fact:
+    crosslink_binary: "{{ crosslink_binary | default(node_binary_link.stat.lnk_target | default('zebrad') | basename) }}"
+    crosslink_commit: "{{ crosslink_commit | default((node_commit_now.stdout | default('')) if (node_commit_now.rc | default(1)) == 0 else '') }}"
+
+# ─── Service state ───────────────────────────────────────────────────────────
+# The record is read from the node's journal, so the node must be up.
+
+- name: Read service state
+  ansible.builtin.command: systemctl is-active {{ crosslink_service_name | quote }}
+  register: node_service_state
+  changed_when: false
+  failed_when: false
+
+- name: Read journal of the failed service
+  ansible.builtin.command: journalctl -u {{ crosslink_service_name | quote }} -n 30 --no-pager -o cat
+  register: node_journal_tail
+  changed_when: false
+  failed_when: false
+  when: node_service_state.stdout != 'active'
+
+- name: Check the node is running
+  ansible.builtin.fail:
+    msg: |-
+      {{ crosslink_service_name }} is {{ node_service_state.stdout | default('unknown', true) }}, not active.
+      Last 30 journal lines:
+      {{ node_journal_tail.stdout | default('(no journal)', true) }}
+  when: node_service_state.stdout != 'active'
+
+# ─── Node report ─────────────────────────────────────────────────────────────
+# Reads this run's journal as a stream, never into a variable: zebrad writes
+# hundreds of megabytes per run, and bash holding that segfaults after a
+# minute with no message. The start facts
+# (payout address, advertised address, seed path) are in the first lines of a
+# run; the BFT prefix is on every BFT line, so the last lines have it. On a
+# miner, falls back to the full journal for the payout address, which is
+# logged only at start.
+
+- name: Read node journal
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      svc={{ crosslink_service_name | quote }}
+      inv=$(systemctl show -p InvocationID --value "$svc" 2>/dev/null)
+      run() {
+        if [ -n "$inv" ]; then
+          journalctl -u "$svc" _SYSTEMD_INVOCATION_ID="$inv" -o cat --no-pager 2>/dev/null
+        else
+          journalctl -u "$svc" -o cat --no-pager -n 20000 2>/dev/null
+        fi
+      }
+      pick() { grep -aoE "$1" | tail -1 | sed -E "s/$2//g"; }
+      first() { run | head -n 5000 | pick "$1" "$2"; }
+      last() { journalctl -u "$svc" -o cat --no-pager -n 50000 2>/dev/null | pick "$1" "$2"; }
+      miner=$(first 'Mining to t[1-9A-HJ-NP-Za-km-z]{20,}' 'Mining to ')
+      {% if crosslink_mining_enabled | bool %}
+      # newest "Mining to" line: journalctl searches backwards, -n 1 stops it
+      # at the first hit (a pipe into head does not: journalctl buffers).
+      # Never the whole journal (gigabytes on a miner).
+      if [ -z "$miner" ]; then
+        miner=$(journalctl -u "$svc" -r -n 1 -o cat --no-pager --grep 'Mining to t[1-9A-HJ-NP-Za-km-z]{20,}' 2>/dev/null | pick 'Mining to t[1-9A-HJ-NP-Za-km-z]{20,}' 'Mining to ')
+      fi
+      {% endif %}
+      advert=$(first 'public IP: [^ ]+' 'public IP: ')
+      # The capability a delegator stakes to: "zfinv1" + 128 base64url chars,
+      # this node's BFT key plus its self-signature. Logged once at start
+      # (zebrad/src/commands/start.rs, "finalizer address:"). Public.
+      finaddr=$(first 'finalizer address: zfinv1[A-Za-z0-9_-]{128}' 'finalizer address: ')
+      prefix=$(last 'Pub\{[0-9a-f]{4}\}[ 0-9]{0,3}:' ':$')
+      [ -n "$prefix" ] || prefix=$(first 'Pub\{[0-9a-f]{4}\}[ 0-9]{0,3}:' ':$')
+      seedp=$(first 'getting key seed from .[^"]+.' 'getting key seed from .|.$')
+      vers=$({{ crosslink_home }}/bin/zebrad --version 2>/dev/null | head -1)
+      # The headless wallet prints its own addresses at start (wallet/src/lib.rs):
+      # the transparent one, which is the payout address while no miner_address
+      # is set, and the unified one, which rewards shielded pays. Public.
+      walt=$(first 'USER WALLET T-ADDRESS: +t[1-9A-HJ-NP-Za-km-z]{20,}' 'USER WALLET T-ADDRESS: +')
+      walu=$(first 'USER WALLET ADDRESS: +u[a-z0-9]{20,}' 'USER WALLET ADDRESS: +')
+      [ -n "$miner" ] || miner="$walt"
+      python3 - "$miner" "$advert" "$prefix" "$seedp" "$vers" "$finaddr" "$walu" <<'PYEOF'
+      import json, sys
+      keys = ["miner_address", "advertised", "bft_prefix", "seed_path", "version",
+              "finalizer_address", "wallet_address"]
+      print(json.dumps(dict(zip(keys, sys.argv[1:]))))
+      PYEOF
+  register: node_report
+  changed_when: false
+  # The payout address is printed before the node opens the network; the
+  # finalizer address after the seed peers have answered, a few seconds later
+  # on a fresh state. Read right after a restart, the journal had the first
+  # and not the second, and the card said "not logged yet" (2026-10-01, the
+  # first v14 miner). On a finalizer, wait for it: up to a minute.
+  until: >-
+    not (crosslink_finalizer_enabled | bool)
+    or ((node_report.stdout | from_json).finalizer_address | default('') | length > 0)
+  retries: 12
+  delay: 5
+
+- name: Parse node report
+  ansible.builtin.set_fact:
+    node_facts: "{{ node_report.stdout | from_json }}"
+
+# The seed is not at <cache_dir>/secret.seed. At config load zebrad appends a
+# season-named directory to cache_dir and never writes it back
+# (zebrad/src/config.rs, the one `.push("…")` there). The name
+# changes with a release, so the path the node logged wins, always.
+#
+# The line is printed once, at start. On a node that has run for days the
+# journal has rotated it away, so the fallback is the season directory read
+# from the source (crosslink_node's season.yml), never <data dir>/secret.seed,
+# where no build keeps it.
+- name: Read the season directory when the node role did not run
+  ansible.builtin.include_role:
+    name: crosslink_node
+    tasks_from: season
+  when:
+    - not (node_facts.seed_path | default(''))
+    - crosslink_season_seed is not defined
+
+- name: Resolve seed path
+  ansible.builtin.set_fact:
+    node_seed_path: >-
+      {{ node_facts.seed_path | default(crosslink_season_seed | default(''), true)
+         | default(node_seed_path, true) }}
+
+# Log prefix is Pub{ab12}<seat>:. An empty seat is expected: this node is not
+# a finalizer.
+- name: Set BFT facts
+  ansible.builtin.set_fact:
+    node_bft_fingerprint: "{{ (node_facts.bft_prefix | regex_search('[0-9a-f]{4}')) | default('', true) }}"
+    node_bft_seat: "{{ (node_facts.bft_prefix | regex_replace('^Pub\\{[0-9a-f]{4}\\}\\s*', '')) | trim }}"
+    node_finalizer_address: "{{ node_facts.finalizer_address | default('', true) }}"
+
+# With rewards shielded the payout address is the wallet's own unified
+# address, as the node role wrote it (crosslink_wallet_address) or as the node
+# printed it; the seed is still the key to the rewards.
+- name: Set payout facts
+  ansible.builtin.set_fact:
+    node_miner_shielded: "{{ (crosslink_mining_enabled | bool) and (crosslink_miner_shielded | bool) and not crosslink_miner_address }}"
+    node_wallet_address: "{{ crosslink_wallet_address | default(node_facts.wallet_address | default(''), true) }}"
+
+- name: Set payout address
+  ansible.builtin.set_fact:
+    node_miner_address: >-
+      {{ crosslink_miner_address if crosslink_miner_address
+         else (node_wallet_address if (node_miner_shielded | bool and node_wallet_address)
+               else (node_facts.miner_address | default(''))) }}
+    node_miner_address_source: >-
+      {{ 'inventory (crosslink_miner_address)' if crosslink_miner_address
+         else ('own wallet, shielded (secret.seed; crosslink_miner_shielded)' if node_miner_shielded | bool
+               else 'own wallet (secret.seed)') }}
+
+# ─── Key bundle directory ────────────────────────────────────────────────────
+
+# ansible_become as a task var, not just the keyword: an inventory-level
+# ansible_become outranks the keyword and would sudo on the control machine.
+- name: Create key bundle directory
+  ansible.builtin.file:
+    path: "{{ crosslink_keys_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  run_once: true
+
+- name: Create host directory
+  ansible.builtin.file:
+    path: "{{ node_bundle }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+
+# ─── Seed ────────────────────────────────────────────────────────────────────
+# zebrad reads or creates the seed first thing in start() and logs "getting key
+# seed from <path>" (zebrad/src/commands/start.rs). On a running node the file
+# is there within seconds.
+
+- name: Wait for the seed
+  when: node_seed_copied | bool
+  block:
+    # Retries print a countdown; wait_for would sit silent for five minutes.
+    - name: Wait for seed file (up to 5 min)
+      ansible.builtin.stat:
+        path: "{{ node_seed_path }}"
+      register: node_seed_wait
+      until: node_seed_wait.stat.exists
+      retries: 60
+      delay: 5
+      ignore_errors: true
+
+    - name: Read seed file status
+      ansible.builtin.stat:
+        path: "{{ node_seed_path }}"
+      register: node_seed_stat
+
+    - name: Check seed file exists and is 32 bytes
+      ansible.builtin.assert:
+        that:
+          - node_seed_stat.stat.exists
+          - node_seed_stat.stat.size == 32
+        fail_msg: >-
+          {{ node_seed_path }} is
+          {{ (node_seed_stat.stat.size ~ ' bytes, not 32') if node_seed_stat.stat.exists else 'missing' }}.
+          {% if node_seed_stat.stat.exists %}
+          Do not restart the node: a bad seed is replaced at random on start.
+          {% elif node_facts.seed_path | default('') %}
+          That is the path the node logged, and no file is there. Check the
+          journal for a write error: journalctl -u {{ crosslink_service_name }} -n 50
+          {% else %}
+          The node has not logged "getting key seed from" yet, so it has not
+          reached start(). Check: journalctl -u {{ crosslink_service_name }} -n 50
+          {% endif %}
+        quiet: true
+
+# The fingerprint is safe to share. The summary on the host quotes it so the
+# bundle's copy can be checked against the file on the host.
+- name: Read seed fingerprint on the host
+  ansible.builtin.shell: sha256sum {{ node_seed_path | quote }} 2>/dev/null | cut -c1-16
+  register: node_seed_sum
+  changed_when: false
+  failed_when: false
+
+- name: Set host fingerprint fact
+  ansible.builtin.set_fact:
+    node_seed_fingerprint_host: "{{ (node_seed_sum.stdout | default('')) | trim }}"
+
+# ─── Copy the seed (miners only) ─────────────────────────────────────────────
+# On a miner without a payout address the seed is the only key to the rewards,
+# so it is copied to the control machine. A seed already in the bundle is never
+# overwritten by a different one. A different seed on the host means the node
+# was started without its seed (a wiped or moved data directory, or a release
+# that renamed the season directory) and now has a new identity and a new
+# wallet, while the bundled seed may be the only key to rewards already mined.
+
+- name: Copy the seed
+  when: node_seed_copied | bool
+  block:
+    - name: Read the bundled seed's status
+      ansible.builtin.stat:
+        path: "{{ node_bundle }}/secret.seed"
+      register: node_bundle_seed
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_become: false
+
+    - name: Read the bundled seed's fingerprint
+      ansible.builtin.command: >-
+        python3 {{ (playbook_dir ~ '/tools/seed-tool.py') | realpath }}
+        fingerprint {{ node_bundle }}/secret.seed
+      register: node_bundle_sum
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_become: false
+      when: node_bundle_seed.stat.exists
+
+    - name: Refuse to overwrite a different bundled seed
+      ansible.builtin.assert:
+        that: (node_bundle_sum.stdout | trim) == node_seed_fingerprint_host
+        fail_msg: >-
+          The seed on {{ inventory_hostname }} ({{ node_seed_fingerprint_host }})
+          is not the one in the bundle ({{ node_bundle_sum.stdout | trim }}). The
+          node was started without its seed and now has a new identity and a new
+          wallet. The bundle is untouched. To keep the old wallet: stop the node,
+          put the bundled secret.seed at {{ node_seed_path }}, start the node,
+          re-run. To adopt the new seed: move {{ node_bundle }} away and re-run.
+        quiet: true
+      when: node_bundle_seed.stat.exists
+
+    - name: Fetch seed file
+      ansible.builtin.fetch:
+        src: "{{ node_seed_path }}"
+        dest: "{{ node_bundle }}/secret.seed"
+        flat: true
+        validate_checksum: true
+
+    - name: Restrict seed file permissions
+      ansible.builtin.file:
+        path: "{{ node_bundle }}/secret.seed"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_become: false
+
+    - name: Convert seed (hex, mnemonic, fingerprint)
+      ansible.builtin.command: >-
+        python3 {{ (playbook_dir ~ '/tools/seed-tool.py') | realpath }}
+        {{ item }} {{ node_bundle }}/secret.seed
+      loop: [hex, mnemonic, fingerprint]
+      register: node_seed_forms
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_become: false
+      no_log: true
+
+    - name: Set seed facts
+      ansible.builtin.set_fact:
+        node_seed_hex: "{{ node_seed_forms.results[0].stdout }}"
+        node_seed_mnemonic: "{{ node_seed_forms.results[1].stdout }}"
+        node_seed_fingerprint: "{{ node_seed_forms.results[2].stdout }}"
+      no_log: true
+
+    - name: Write seed.hex and mnemonic.txt
+      ansible.builtin.copy:
+        content: "{{ item.body }}\n"
+        dest: "{{ node_bundle }}/{{ item.name }}"
+        mode: "0600"
+      loop:
+        - { name: seed.hex, body: "{{ node_seed_hex }}" }
+        - { name: mnemonic.txt, body: "{{ node_seed_mnemonic }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_become: false
+      no_log: true
+
+# ─── Record ──────────────────────────────────────────────────────────────────
+# The rewards are not read here: a deploy must not depend on the node's RPC
+# being up. rewards.yml (the playbook) reads them on demand.
+
+
+- name: Write identity.json
+  ansible.builtin.template:
+    src: identity.json.j2
+    dest: "{{ node_bundle }}/identity.json"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+
+- name: Write NODE-CARD.md
+  ansible.builtin.template:
+    src: NODE-CARD.md.j2
+    dest: "{{ node_bundle }}/NODE-CARD.md"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+
+# The same record on the host, without the phrase: role, every file the
+# playbook put there, payout address, fingerprint, checks, rebuild steps.
+- name: Write host summary
+  ansible.builtin.template:
+    src: HOST-README.md.j2
+    dest: "{{ crosslink_config_dir }}/README.md"
+    owner: root
+    group: "{{ crosslink_user }}"
+    mode: "0640"
+
+- name: Show the record
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: {{ ((['miner'] if crosslink_mining_enabled | bool else []) + (['finalizer'] if crosslink_finalizer_enabled | bool else [])) | join(' + ') | default('node', true) }},
+      {{ crosslink_ref }} at {{ (crosslink_commit | default(''))[:12] | default('unknown', true) }}.
+      {{ ('Mining to ' ~ (node_miner_address | default('an address not logged yet', true)) ~ ', ' ~ node_miner_address_source ~ '. Seed ' ~ node_seed_fingerprint ~ ', phrase in ' ~ node_bundle ~ '/mnemonic.txt.') if crosslink_mining_enabled | bool else 'Not mining.' }}
+      Card: {{ node_bundle }}/NODE-CARD.md; on the host: {{ crosslink_config_dir }}/README.md

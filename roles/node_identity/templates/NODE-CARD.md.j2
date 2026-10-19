@@ -1,0 +1,205 @@
+# {{ inventory_hostname }}
+
+{% set node_roles = (['miner'] if crosslink_mining_enabled | bool else []) + (['finalizer'] if crosslink_finalizer_enabled | bool else []) %}
+Role: **{{ node_roles | join(' + ') if node_roles else 'node' }}** on the {{ crosslink_network }} network.
+{% if crosslink_mining_enabled | bool %}
+Mines.
+{% endif %}
+{% if crosslink_finalizer_enabled | bool %}
+Signs blocks: stake points at the finalizer address below, and the seed on this host is that identity. Run it on one machine only. Two nodes on one identity is equivocation.
+{% else %}
+Not a finalizer. No stake points at its key.
+{% endif %}
+
+Written by crosslink-ansible on {{ ansible_date_time.iso8601 }} from what the host reported. The host carries the same summary without the phrase at `{{ crosslink_config_dir }}/README.md`.
+
+## Files in this directory
+
+{% if node_seed_copied | bool %}
+| file | content | secret |
+|---|---|---|
+| `secret.seed` | the node's seed, 32 bytes, copied from the host | yes |
+| `seed.hex` | the same seed as hex | yes |
+| `mnemonic.txt` | the same seed as 24 BIP-39 words | yes |
+| `identity.json` | the deployment record | no |
+| `NODE-CARD.md` | this file; it quotes the phrase below | yes |
+
+Seed fingerprint (sha256 prefix): `{{ node_seed_fingerprint }}`. Safe to share. Use it to compare copies.
+
+## The seed
+
+`secret.seed` is `{{ node_seed_path }}` on the host. It is:
+
+- the node's BFT identity{{ ' — **the finalizer key stake points at**' if crosslink_finalizer_enabled | bool else '' }},
+- the wallet seed, and
+{% if crosslink_mining_enabled | bool and not crosslink_miner_address %}
+- **the key to this node's own wallet, where its mining rewards go** (no payout address is configured).
+{% else %}
+- the key to the node's own address.
+{% endif %}
+
+zebrad creates a new random seed whenever the file is missing, without warning.
+{% if crosslink_mining_enabled | bool and not crosslink_miner_address %}
+Losing this file loses the rewards.
+{% endif %}
+{% if crosslink_finalizer_enabled | bool %}
+Losing it loses the finalizer: the stake keeps pointing at a key nobody holds, and the identity cannot be rebuilt from anything else.
+{% endif %}
+
+The seed is BIP-39 entropy. Any wallet can restore it from the phrase:
+
+```
+{{ node_seed_mnemonic }}
+```
+
+Derivation (`zebra-crosslink/wallet/src/lib.rs`): phrase → `to_seed("")[..32]` → ZIP-32 account 0 → transparent address, external index 0.
+{% else %}
+| file | content | secret |
+|---|---|---|
+| `identity.json` | the deployment record | no |
+| `NODE-CARD.md` | this file | no |
+
+## The seed
+
+Not copied. `{{ node_seed_path }}` on the host is this node's BFT identity and wallet seed, but an RPC node has no stake on its key and no rewards, so a fresh one changes nothing. zebrad creates a new random seed whenever the file is missing.
+{% endif %}
+
+## Finalizer
+
+{% if crosslink_finalizer_enabled | bool %}
+| | |
+|---|---|
+| finalizer address | `{{ node_finalizer_address | default('not logged yet', true) }}` |
+| key fingerprint | `{{ node_bft_fingerprint | default('not logged yet', true) }}` |
+| roster seat | {{ node_bft_seat if node_bft_seat else 'none yet' }} |
+
+The finalizer address is the whole capability a delegator stakes to: this node's BFT key and its signature over that key. Public. The node logs it once at start, and it is the same as long as the seed is.
+
+```bash
+journalctl -u {{ crosslink_service_name }} | grep -m1 'finalizer address:'
+```
+
+A seat appears once stake points here and this node is inside the active roster. The roster is capped: only the largest few finalizers by stake vote at any height, and a finalizer outside that set signs nothing and earns no commission. Stake first, then watch the prefix `Pub{...}<seat>:` in the log.
+{% else %}
+Off. This node holds a BFT key like every node, and nothing stakes to it. To make it a finalizer: add `{{ inventory_hostname }}` to the `finalizer` group, re-run, and stake to the address the run records.
+{% endif %}
+
+## Mining
+
+{% if crosslink_mining_enabled | bool %}
+| | |
+|---|---|
+| payout address | `{{ node_miner_address | default('not logged yet', true) }}` |
+| source | {{ node_miner_address_source }} |
+{% if node_wallet_address | default('') %}
+| wallet address | `{{ node_wallet_address }}` |
+{% endif %}
+| coinbase data | {{ crosslink_miner_extra_coinbase_data | default('(default)', true) }} |
+
+- {{ crosslink_miner_threads }} solver thread{{ '' if crosslink_miner_threads | int == 1 else 's' }} (`crosslink_miner_threads`), {{ 'low' if crosslink_miner_low_priority | bool else 'normal' }} priority, about 144 MB each.
+- Mining starts only after the node is synced. A syncing node is not broken.
+{% if node_miner_shielded | default(false) | bool %}
+- Rewards are shielded (`crosslink_miner_shielded`): every block pays one Ironwood note to this wallet's own unified address. The chain shows no address they went to; `rewards.json` holds what the wallet can spend, not what it received. A note is spendable 3 blocks after the block that pays it.
+{% else %}
+- Rewards are spendable {{ crosslink_coinbase_maturity }} blocks after the block that pays them on this feature-net (Zcash: 100).
+{% endif %}
+
+```bash
+journalctl -u {{ crosslink_service_name }} -f | grep -E 'mining|template'
+```
+{% if not crosslink_miner_address %}
+
+Rewards go to this node's own wallet: the seed above. To pay them elsewhere, set `crosslink_miner_address` in the inventory and re-run.
+{% endif %}
+
+## Rewards
+
+{% if node_rewards is defined and node_rewards.shielded | default(false) %}
+Read from the wallet on the host at {{ node_rewards.read_at }}, tip {{ node_rewards.text.tip }}: spendable {{ node_rewards.text.spendable }} cTAZ, pending {{ node_rewards.text.pending }} cTAZ. The rewards are shielded, so what was received in total is not on the chain to read. The same figures are in `rewards.json` beside this file.
+{% elif node_rewards is defined %}
+Read from the node at {{ node_rewards.read_at }}, tip {{ node_rewards.text.tip }}. The same figures are in `rewards.json` beside this file.
+
+| | |
+|---|---|
+| received in total | {{ node_rewards.text.received }} cTAZ in {{ node_rewards.text.transactions }} transactions |
+| balance | {{ node_rewards.text.balance }} cTAZ: spendable {{ node_rewards.text.spendable }}, immature {{ node_rewards.text.immature }} |
+| last 24 hours | {{ node_rewards.text.day }} |
+| newest reward | {{ node_rewards.text.newest }} |
+
+A transaction paying this address is a coinbase unless someone sent to it. `received` is the lifetime total; `balance` is what is still unspent.
+{% else %}
+Not read by the deploy. The rewards playbook reads them.
+{% endif %}
+
+To read them, from the control machine:
+
+```bash
+ansible-playbook -i inventory.yml rewards.yml -l {{ inventory_hostname }}
+```
+
+Or ask any synced node about the address, with the script the playbook uses:
+
+```bash
+python3 roles/node_identity/files/rewards.py --rpc http://127.0.0.1:8232/ {{ node_miner_address | default('<payout address>', true) }}
+```
+{% else %}
+Off. To enable: add `{{ inventory_hostname }}` to the `miner` group and re-run.
+{% endif %}
+
+## Software
+
+| | |
+|---|---|
+| ref | `{{ crosslink_ref }}` |
+| commit | `{{ crosslink_commit | default('unknown', true) }}` |
+| version | {{ node_facts.version | default('unknown', true) }} |
+| binary | `{{ crosslink_home }}/bin/{{ crosslink_binary | default('zebrad') }}` |
+| unit | `{{ crosslink_service_name }}.service` |
+| config | `{{ crosslink_config_dir }}/zebrad.toml` |
+| data | `{{ crosslink_data_dir }}` |
+{% if crosslink_commit | default('') and crosslink_ref != crosslink_commit %}
+
+To pin another host to this exact build: `crosslink_ref: "{{ crosslink_commit }}"`.
+{% endif %}
+
+## Network
+
+| | |
+|---|---|
+| public address (config) | `{{ crosslink_public_address }}` |
+| public address (node log) | `{{ node_facts.advertised | default('unknown', true) }}` |
+| p2p | `{{ crosslink_p2p_listen }}` |
+| RPC | `{{ crosslink_rpc_listen }}` (loopback only) |
+| BFT fingerprint | `{{ node_bft_fingerprint | default('not logged yet', true) }}` |
+| roster seat | {{ node_bft_seat if node_bft_seat else 'none (expected)' }} |
+{% if node_facts.advertised | default('') and node_facts.advertised != crosslink_public_address %}
+
+**Config and node log disagree.** The running process predates the config. Restart the node and re-run.
+{% endif %}
+
+## Restore
+
+{% if node_seed_copied | bool %}
+1. Provision the host. Put it in the same groups.
+2. Copy `secret.seed` to `{{ node_seed_path }}` **before the first start**:
+
+```bash
+scp secret.seed {{ ansible_host | default(inventory_hostname) }}:/tmp/secret.seed
+ssh {{ ansible_host | default(inventory_hostname) }} \
+  'install -d -o {{ crosslink_user }} -g {{ crosslink_user }} -m 700 {{ node_seed_path | dirname }} &&
+   install -o {{ crosslink_user }} -g {{ crosslink_user }} -m 600 \
+     /tmp/secret.seed {{ node_seed_path }} && rm /tmp/secret.seed'
+```
+
+3. Run the playbook.
+
+The seed's directory is named by the release for the season (`zebrad/src/config.rs`). A release that renames it starts the node with a fresh seed, a new identity and a new wallet. Before upgrading, read the name in the new release and copy the seed there first. The playbook never overwrites this bundle's seed with a different one: a run after such a start stops and says which seed is which.
+
+{% if crosslink_finalizer_enabled | bool %}
+This seed is a finalizer identity. Restore it onto one host at a time, and stop the old one first. Two running nodes on one identity is equivocation.
+{% else %}
+Never restore a seed onto two running hosts if it belongs to a finalizer. That is equivocation. For the nodes here it is harmless.
+{% endif %}
+{% else %}
+Provision the host, put it in the same groups, run the playbook. Nothing to restore: the chain state resyncs and the seed is regenerated.
+{% endif %}

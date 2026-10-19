@@ -1,0 +1,6 @@
+---
+- name: Restart crosslink-node
+  ansible.builtin.systemd_service:
+    name: "{{ crosslink_service_name }}"
+    state: restarted
+    daemon_reload: true

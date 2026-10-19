@@ -1,0 +1,23 @@
+# Crosslink nodes
+
+{{ fleet_hosts | length }} host{{ '' if fleet_hosts | length == 1 else 's' }} with a record here, {{ ansible_date_time.iso8601 }}. One directory per host. A host stays in this table until its directory is removed. Every `secret.seed` is a private key; RPC nodes have none here.
+
+| host | role | ref | commit | payout address | received (cTAZ, at last run) | seed fingerprint | last run |
+|---|---|---|---|---|---|---|---|
+{% for r in fleet_hosts %}
+| [{{ r.host }}]({{ r.host }}/NODE-CARD.md) | {{ r.roles | default([]) | join(' + ') | default('node', true) }} | `{{ r.source.ref | default('unknown', true) }}` | `{{ (r.source.commit | default(''))[:12] | default('unknown', true) }}` | {{ ('`' ~ r.mining.payout_address ~ '`') if r.mining.payout_address | default('') else '—' }} | {{ r.rewards.text.received if (r.rewards | default(none)) else '—' }} | {{ ('`' ~ r.seed.sha256_prefix ~ '`') if r.seed.sha256_prefix | default('') else '—' }} | {{ (r.gathered_utc | default(''))[:10] | default('unknown', true) }} |
+{% endfor %}
+
+Two hosts with the same seed fingerprint run the same identity. Check this table each run.
+{% set own = [] %}
+{% for r in fleet_hosts %}
+{% if r.mining.enabled | default(false) and r.mining.payout_from_seed | default(false) %}
+{% set _ = own.append(r.host) %}
+{% endif %}
+{% endfor %}
+{% if own %}
+
+## Rewards in the miner's own wallet
+
+{{ own | join(', ') }}: no `crosslink_miner_address` is set, so rewards go to the wallet zebrad made from the host's seed (shielded, to its unified address, where `payout_shielded` is set). The `secret.seed` and `mnemonic.txt` here are the only keys to it. To pay rewards elsewhere instead, set a payout address and re-run.
+{% endif %}

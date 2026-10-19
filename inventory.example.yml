@@ -1,0 +1,85 @@
+# Copy to inventory.yml and fill in your hosts.
+#
+# Groups (a host can be in several):
+#   node       a full node: RPC on loopback, no mining
+#   miner      a full node with the internal miner on
+#   finalizer  a full node whose BFT key is meant to carry stake
+#
+# Never list a finalizer this playbook does not own. The preflight refuses
+# hosts on forbidden_hostnames and hosts already running zebrad. The
+# `finalizer` group is for a node this playbook installed: it copies the seed
+# (that node's identity) to the key bundle and records the finalizer address
+# stake is sent to. It never writes a BFT key seed into the config.
+#
+# One host can carry every role on a test network. On a network that matters,
+# keep mining and finality on separate hosts.
+#
+# One network per inventory file. Every host in a file is on one chain; a
+# second network gets its own file (README.md, "Networks").
+
+all:
+  vars:
+    ansible_user: root            # or a sudo user + `ansible_become: true`
+
+  # Overrides go at host level. Vars under `all: vars:` rank below
+  # group_vars/all/ and would be ignored.
+  #
+  # Never leave a key bare. `crosslink_hardforks:` with nothing under it
+  # overrides the group_vars list with null and the node role stops.
+  # Delete the key to get the default back.
+
+  children:
+    node:
+      hosts:
+        rpc-1:
+          ansible_host: 203.0.113.20
+          crosslink_identity_seed: "CHANGE-ME"   # paste the output of: openssl rand -hex 16
+          # crosslink_public_ip: 203.0.113.20          # if behind NAT
+          # crosslink_data_root: /mnt/ssd/crosslink    # dedicated volume
+
+    miner:
+      hosts:
+        miner-1:
+          ansible_host: 203.0.113.30
+          crosslink_identity_seed: "CHANGE-ME"   # openssl rand -hex 16, a different one per host
+          # crosslink_miner_threads: 6              # solver threads: cores minus two
+          # crosslink_miner_address: "tm…"          # optional. Default: the miner's own wallet
+          # crosslink_miner_extra_coinbase_data: "example.org"
+          # crosslink_ref: "main"                   # tag, branch or commit
+          # Rewards shielded: every block pays one Ironwood note to this
+          # wallet's own unified address. Needs the wallet on. The stake
+          # script then spends those notes, and the chain shows no address
+          # the stake was paid from. README.md, "Rewards shielded".
+          # crosslink_disable_wallet: false
+          # crosslink_miner_shielded: true
+          # zebrad's Prometheus metrics for a scraper outside this playbook;
+          # the port opens in ufw to the addresses listed. README.md, "Metrics".
+          # crosslink_metrics_listen: "0.0.0.0:9999"
+          # crosslink_metrics_allow_from: ["203.0.113.5"]
+
+    # A finalizer this playbook owns. Its seed is its identity, so the run
+    # copies the seed to the key bundle and writes the finalizer address to
+    # the node's card; stake goes to that address. Run one node per identity.
+    #
+    # finalizer:
+    #   hosts:
+    #     finalizer-1:
+    #       ansible_host: 203.0.113.40
+    #       crosslink_public_ip: 203.0.113.40
+    #       crosslink_identity_seed: "CHANGE-ME"   # openssl rand -hex 16
+    #       # only to stake from the host itself; see README.md, "Finalizer"
+    #       crosslink_disable_wallet: false
+    #       # stake its rewards by itself, to this finalizer address
+    #       # crosslink_autostake_to: "zfinv1…"
+    #       # crosslink_autostake_dry_run: true    # first: check, send nothing
+    finalizer:
+      hosts: {}
+
+    # Another network on its own host, in its own inventory file. The name
+    # picks a row of crosslink_chains (group_vars/all/main.yml): the code and
+    # the calendar follow it.
+    #
+    #     nightly-1:
+    #       ansible_host: 203.0.113.50
+    #       crosslink_public_ip: 203.0.113.50
+    #       crosslink_network: nightly

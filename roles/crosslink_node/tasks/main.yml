@@ -1,0 +1,650 @@
+---
+# A Crosslink full node from the official source: fetched, built, configured
+# and run under systemd. Mining is a config switch (miner group). No finalizer
+# key is ever written; the node's identity is its own seed file. See README.md.
+
+- name: Create service user
+  ansible.builtin.user:
+    name: "{{ crosslink_user }}"
+    system: true
+    home: "{{ crosslink_home }}"
+    create_home: true
+    shell: /usr/sbin/nologin
+
+- name: Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default(crosslink_user) }}"
+    group: "{{ item.owner | default(crosslink_user) }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - { path: "{{ crosslink_home }}/bin" }
+    - { path: "{{ crosslink_data_dir }}", mode: "0750" }
+    - { path: "{{ crosslink_config_dir }}", owner: root }
+
+# ─── Source and build ────────────────────────────────────────────────────────
+# crosslink_ref may be a tag, branch or commit. It is resolved to a commit and
+# the binary is named after that commit, so a moved branch triggers a rebuild.
+
+- name: Install build dependencies
+  ansible.builtin.apt:
+    name:
+      - git
+      - curl
+      - ca-certificates
+      - build-essential
+      - clang
+      - libclang-dev
+      - pkg-config
+      - libssl-dev
+      - protobuf-compiler
+    state: present
+    update_cache: true
+  when: zebrad_install_mode == "build"
+
+- name: Install Rust toolchain
+  ansible.builtin.shell: >-
+    sudo -u {{ crosslink_user }} env HOME={{ crosslink_home }}
+    bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain stable'
+  args:
+    creates: "{{ crosslink_home }}/.cargo/bin/cargo"
+  when: zebrad_install_mode == "build"
+
+- name: Initialise source checkout
+  ansible.builtin.shell: >-
+    sudo -u {{ crosslink_user }} env HOME={{ crosslink_home }} bash -c
+    'git init -q {{ crosslink_home }}/src &&
+     git -C {{ crosslink_home }}/src remote add origin {{ crosslink_repo }}'
+  args:
+    creates: "{{ crosslink_home }}/src/.git"
+  when: zebrad_install_mode == "build"
+
+- name: Check for existing checkout
+  ansible.builtin.stat:
+    path: "{{ crosslink_home }}/src/zebra-crosslink/Cargo.toml"
+  register: node_src
+  when: zebrad_install_mode == "build"
+
+# Every git command below runs as the service user, the checkout's owner.
+# Run as root, git refuses the repository outright ("dubious ownership").
+- name: Record commit before fetch
+  ansible.builtin.command: sudo -u {{ crosslink_user }} git -C {{ crosslink_home }}/src rev-parse HEAD
+  register: node_commit_before
+  changed_when: false
+  failed_when: false
+  when: zebrad_install_mode == "build"
+
+- name: Fetch {{ crosslink_ref }}
+  ansible.builtin.shell: >-
+    sudo -u {{ crosslink_user }} env HOME={{ crosslink_home }} bash -c
+    'git -C {{ crosslink_home }}/src fetch --depth 1 --force origin {{ crosslink_ref | quote }} &&
+     git -C {{ crosslink_home }}/src checkout -q -f --detach FETCH_HEAD &&
+     git -C {{ crosslink_home }}/src submodule update --init --recursive --depth 1'
+  changed_when: false
+  when:
+    - zebrad_install_mode == "build"
+    # a frozen checkout still has to be fetched once
+    - (crosslink_update_source | bool) or not (node_src.stat.exists | default(false))
+
+- name: Record checked-out commit
+  ansible.builtin.command: sudo -u {{ crosslink_user }} git -C {{ crosslink_home }}/src rev-parse HEAD
+  register: node_commit
+  changed_when: node_commit.stdout != (node_commit_before.stdout | default(''))
+  when: zebrad_install_mode == "build"
+
+- name: Set build name
+  ansible.builtin.set_fact:
+    crosslink_commit: "{{ (node_commit | default({})).stdout | default('') }}"
+    crosslink_ref_slug: "{{ crosslink_ref | regex_replace('[^A-Za-z0-9._-]', '_') }}"
+
+- name: Set binary name
+  ansible.builtin.set_fact:
+    crosslink_binary: >-
+      {{ ('zebrad-' ~ crosslink_ref_slug ~ '-' ~ crosslink_commit[:12])
+         if crosslink_commit else ('zebrad-' ~ crosslink_ref_slug) }}
+
+- name: Build zebrad (about 20 min cold)
+  ansible.builtin.shell: >-
+    sudo -u {{ crosslink_user }}
+    env HOME={{ crosslink_home }} PATH={{ crosslink_home }}/.cargo/bin:/usr/bin:/bin
+    bash -c 'cd {{ crosslink_home }}/src/zebra-crosslink && cargo build --release'
+  args:
+    creates: "{{ crosslink_home }}/bin/{{ crosslink_binary }}"
+  async: 5400
+  poll: 30
+  when: zebrad_install_mode == "build"
+
+- name: Install built binary
+  ansible.builtin.copy:
+    src: "{{ crosslink_home }}/src/zebra-crosslink/target/release/zebrad"
+    dest: "{{ crosslink_home }}/bin/{{ crosslink_binary }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  when: zebrad_install_mode == "build"
+  notify: Restart crosslink-node
+
+- name: Upload local binary
+  ansible.builtin.copy:
+    src: "{{ zebrad_local_binary }}"
+    dest: "{{ crosslink_home }}/bin/{{ crosslink_binary }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: zebrad_install_mode == "copy"
+  notify: Restart crosslink-node
+
+- name: Link active binary
+  ansible.builtin.file:
+    src: "{{ crosslink_home }}/bin/{{ crosslink_binary }}"
+    dest: "{{ crosslink_home }}/bin/zebrad"
+    state: link
+  notify: Restart crosslink-node
+
+# The marker is the miner's startup log line. A binary built without the
+# internal-miner feature would run but never mine.
+- name: Check binary contains the miner
+  ansible.builtin.command: >-
+    grep -a -q 'launching mining tasks with parallel solvers'
+    {{ crosslink_home }}/bin/{{ crosslink_binary }}
+  register: node_miner_symbol
+  changed_when: false
+  failed_when: false
+  when: crosslink_mining_enabled | bool
+
+- name: Fail if a miner host has no miner in its binary
+  ansible.builtin.assert:
+    that: node_miner_symbol.rc == 0
+    fail_msg: >-
+      {{ crosslink_home }}/bin/{{ crosslink_binary }} was built without zebrad's
+      internal-miner feature. It would run but never mine. Check the ref's
+      zebrad/Cargo.toml default features, or rebuild with the feature on.
+    quiet: true
+  when: crosslink_mining_enabled | bool
+
+# The node opens a visualizer window when it finds a display, and stops when
+# that window closes. A host has no display, so the node falls back to
+# headless, but it tries first. `--headless` skips the try. Older builds
+# reject the flag, so the binary is asked whether it has it.
+- name: Check binary takes --headless
+  ansible.builtin.command: "{{ crosslink_home }}/bin/{{ crosslink_binary }} start --help"
+  register: node_start_help
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# ─── The chain's parameters ──────────────────────────────────────────────────
+# The binary carries the chain (its magic, genesis, parameters and seed
+# peers). The chain's table is read back out of the binary and written into
+# the config, whole, with its checkpoint list turned off: a chain read from a
+# config file is built on the public testnet's defaults, so a field the file
+# leaves out is the public testnet's, and a file that names the network
+# without the whole table is a node on the public testnet that looks healthy
+# and talks to nobody. The PoW seed peers come with it, from the same binary;
+# the BFT and state peer lists stay out so the binary's own are used. A newer
+# build rewrites all of it on the next run. chain-params.py says the rest.
+
+- name: Resolve the binary's own defaults
+  ansible.builtin.command: "{{ crosslink_home }}/bin/zebrad generate"
+  register: node_generated
+  changed_when: false
+
+- name: Install the chain reader
+  ansible.builtin.copy:
+    src: chain-params.py
+    dest: "{{ crosslink_home }}/chain-params.py"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Take the chain's table, with checkpoints off
+  ansible.builtin.command:
+    cmd: "{{ crosslink_home }}/chain-params.py"
+    stdin: "{{ node_generated.stdout }}"
+  register: node_params
+  changed_when: false
+
+- name: Keep it for the config
+  ansible.builtin.set_fact:
+    crosslink_testnet_params: "{{ node_params.stdout | trim }}"
+
+- name: Read the seed peers the binary carries
+  ansible.builtin.command:
+    cmd: "{{ crosslink_home }}/chain-params.py --peers"
+    stdin: "{{ node_generated.stdout }}"
+  register: node_peers
+  changed_when: false
+
+- name: Show the seed peers this node will use
+  ansible.builtin.debug:
+    msg: "{{ node_peers.stdout_lines }}"
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+
+# zebrad hashes public_address into its transport key. A wrong value makes the
+# node unreachable while it looks healthy.
+- name: Check public address is routable
+  ansible.builtin.assert:
+    that:
+      - crosslink_public_ip is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}$')
+      - not (crosslink_public_ip is match('^(127\.|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'))
+    fail_msg: >-
+      crosslink_public_ip is "{{ crosslink_public_ip }}": empty, not IPv4, or
+      not routable. Set crosslink_public_ip for this host in the inventory.
+
+# ─── Hard fork rules ─────────────────────────────────────────────────────────
+# Checked before the config is written. hardforks.yml says why.
+- name: Check hard fork rules
+  ansible.builtin.include_tasks: hardforks.yml
+
+# ─── Rewards shielded ────────────────────────────────────────────────────────
+# crosslink_miner_shielded pays the coinbase to this wallet's own unified
+# address (one Ironwood note a block). The address is the node's to say, so
+# it is read off the node before the config is written, and once more after
+# the first start when the node had not said it yet (below).
+- name: Check the settings rewards shielded needs
+  ansible.builtin.assert:
+    that:
+      - not crosslink_disable_wallet | bool
+      - not crosslink_miner_address
+    fail_msg: >-
+      crosslink_miner_shielded needs the wallet on (crosslink_disable_wallet:
+      false), because the address the rewards go to is the wallet's own, and
+      no crosslink_miner_address, which would pay them elsewhere. Fix the
+      host's inventory entry.
+    quiet: true
+  when: crosslink_mining_enabled | bool and crosslink_miner_shielded | bool
+
+- name: Read the wallet address for rewards shielded
+  ansible.builtin.include_tasks: wallet_address.yml
+  when: crosslink_mining_enabled | bool and crosslink_miner_shielded | bool
+
+- name: Write zebrad.toml
+  ansible.builtin.template:
+    src: zebrad.toml.j2
+    dest: "{{ crosslink_config_dir }}/zebrad.toml"
+    owner: root
+    group: "{{ crosslink_user }}"
+    mode: "0640"
+  notify: Restart crosslink-node
+
+# The file is read back against the binary before the node starts: the chain
+# table has to be the binary's, whole, with checkpoints off, the PoW seed list
+# the binary's, and no BFT or state peer list of the file's own.
+- name: Check the config names the binary's chain
+  ansible.builtin.command:
+    cmd: "{{ crosslink_home }}/chain-params.py --verify {{ crosslink_config_dir }}/zebrad.toml"
+    stdin: "{{ node_generated.stdout }}"
+  changed_when: false
+
+# ─── Service ─────────────────────────────────────────────────────────────────
+
+- name: Write systemd unit
+  ansible.builtin.template:
+    src: crosslink-node.service.j2
+    dest: /etc/systemd/system/{{ crosslink_service_name }}.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart crosslink-node
+
+# ─── Firewall ────────────────────────────────────────────────────────────────
+# Only p2p and the BFT ports open. RPC never does.
+
+- name: Check ufw status
+  ansible.builtin.command: ufw status
+  register: node_ufw
+  changed_when: false
+  failed_when: false
+
+- name: Open p2p and BFT ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+    comment: crosslink node
+  loop:
+    - { port: "{{ crosslink_p2p_listen.split(':') | last }}", proto: tcp }
+    - { port: "{{ crosslink_bft_local_port }}", proto: tcp }
+    - { port: "{{ crosslink_bft_local_port }}", proto: udp }
+    - { port: "{{ crosslink_bft_overlay_port }}", proto: udp }
+  when:
+    - manage_ufw | bool
+    - "'Status: active' in node_ufw.stdout | default('')"
+
+# The metrics port opens to the scrapers the inventory names and to nobody
+# else. With no address listed, or without ufw, the bind address is the only
+# guard: bind loopback or a private interface then.
+- name: Check the metrics settings
+  ansible.builtin.assert:
+    that:
+      - crosslink_metrics_listen is match('^[0-9A-Za-z.:\[\]]+:[0-9]+$')
+      - crosslink_metrics_allow_from is sequence
+      - crosslink_metrics_allow_from is not string
+    fail_msg: >-
+      crosslink_metrics_listen must be an address and a port
+      ("0.0.0.0:9999"), and crosslink_metrics_allow_from a list of addresses
+      or CIDR ranges.
+    quiet: true
+  when: crosslink_metrics_listen | length > 0
+
+- name: Open the metrics port to the scrapers
+  community.general.ufw:
+    rule: allow
+    port: "{{ crosslink_metrics_listen.split(':') | last }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+    comment: crosslink metrics
+  loop: "{{ crosslink_metrics_allow_from }}"
+  when:
+    - crosslink_metrics_listen | length > 0
+    - manage_ufw | bool
+    - "'Status: active' in node_ufw.stdout | default('')"
+
+# ─── The seed across a season rename ─────────────────────────────────────────
+# Before the node starts on this build, its seed must already be in the
+# directory this build reads. Otherwise zebrad writes a random one on start:
+# a new finalizer identity and a new payout wallet, silently. A release may
+# rename the directory; the Nightly Network does with most of them.
+
+- name: Read this build's season directory
+  ansible.builtin.include_tasks: season.yml
+
+- name: Say the season directory could not be read
+  ansible.builtin.debug:
+    msg: >-
+      No source checkout to read the season directory from
+      (zebrad_install_mode: {{ zebrad_install_mode }}). If this build renames
+      it, copy secret.seed into the new directory before the node starts.
+  when: not crosslink_season
+
+- name: Carry the seed into this build's season directory
+  when: crosslink_season | length > 0
+  block:
+    - name: Find this build's seed
+      ansible.builtin.stat:
+        path: "{{ crosslink_season_seed }}"
+        get_checksum: true
+      register: node_season_seed
+
+    - name: Find every seed on the host
+      ansible.builtin.find:
+        paths: "{{ crosslink_data_dir }}"
+        patterns: secret.seed
+        recurse: true
+        depth: 3
+        get_checksum: true
+      register: node_seeds
+      when: not node_season_seed.stat.exists
+
+    - name: Refuse to choose between different seeds
+      ansible.builtin.assert:
+        that: node_seeds.files | map(attribute='checksum') | unique | list | length <= 1
+        fail_msg: >-
+          {{ crosslink_season_seed }} does not exist yet, and the host holds
+          {{ node_seeds.files | length }} different seeds:
+          {{ node_seeds.files | map(attribute='path') | join(', ') }}.
+          The node is not restarted. Copy the right one (compare its
+          fingerprint with the key bundle's) to {{ crosslink_season_seed }},
+          owned by {{ crosslink_user }}, mode 0600, and re-run.
+        quiet: true
+      when: not node_season_seed.stat.exists
+
+    - name: Create the season directory
+      ansible.builtin.file:
+        path: "{{ crosslink_season_seed | dirname }}"
+        state: directory
+        owner: "{{ crosslink_user }}"
+        group: "{{ crosslink_user }}"
+        mode: "0750"
+      when:
+        - not node_season_seed.stat.exists
+        - node_seeds.files | length > 0
+
+    - name: Copy the seed into it
+      ansible.builtin.copy:
+        src: "{{ node_seeds.files[0].path }}"
+        dest: "{{ crosslink_season_seed }}"
+        remote_src: true
+        force: false
+        owner: "{{ crosslink_user }}"
+        group: "{{ crosslink_user }}"
+        mode: "0600"
+      when:
+        - not node_season_seed.stat.exists
+        - node_seeds.files | length > 0
+
+# The restart is a handler, and a handler notified in a run that then fails
+# is dropped: the next run finds the binary already linked, changes nothing,
+# and the node keeps running the old build. So the running process is asked
+# which binary it is. A path that differs from the linked one, or a file
+# replaced under the same name ("(deleted)"), restarts the node.
+- name: Read the binary the node is running
+  ansible.builtin.shell: >-
+    pid=$(systemctl show -p MainPID --value {{ crosslink_service_name | quote }});
+    if [ "${pid:-0}" -gt 0 ]; then readlink /proc/$pid/exe; fi
+  register: node_running_exe
+  changed_when: >-
+    node_running_exe.stdout | length > 0 and
+    (node_running_exe.stdout.endswith(' (deleted)') or
+     node_running_exe.stdout != crosslink_home ~ '/bin/' ~ crosslink_binary)
+  failed_when: false
+  notify: Restart crosslink-node
+
+- name: Enable and start the node
+  ansible.builtin.systemd_service:
+    name: "{{ crosslink_service_name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# The first start of a host with rewards shielded: the config above named no
+# miner_address, because the node had not said its wallet address yet. It
+# prints it a few seconds after starting; read it now, write the config
+# again with it, and restart. From the next run on, the first read has it.
+- name: Read the wallet address after the first start
+  ansible.builtin.include_tasks: wallet_address.yml
+  vars:
+    wallet_address_wait: true
+  when:
+    - crosslink_mining_enabled | bool
+    - crosslink_miner_shielded | bool
+    - not (crosslink_wallet_address | default(''))
+
+- name: Write zebrad.toml with the wallet address
+  ansible.builtin.template:
+    src: zebrad.toml.j2
+    dest: "{{ crosslink_config_dir }}/zebrad.toml"
+    owner: root
+    group: "{{ crosslink_user }}"
+    mode: "0640"
+  notify: Restart crosslink-node
+  when:
+    - crosslink_mining_enabled | bool
+    - crosslink_miner_shielded | bool
+    - crosslink_wallet_address | default('') | length > 0
+
+- name: Refuse to leave rewards shielded unset
+  ansible.builtin.assert:
+    that: crosslink_wallet_address | default('') | length > 0
+    fail_msg: >-
+      crosslink_miner_shielded is set for {{ inventory_hostname }}, but the
+      node has not printed its wallet address ("USER WALLET ADDRESS:") within
+      two minutes of starting, so miner_address is not written and the
+      rewards still go to the transparent payout address. Check that the
+      wallet is on and the node is running (journalctl -u
+      {{ crosslink_service_name }} -n 100), then run again.
+    quiet: true
+  when: crosslink_mining_enabled | bool and crosslink_miner_shielded | bool
+
+# ─── The host's own check ────────────────────────────────────────────────────
+# `sudo crosslink-check`: services, sync, peers, finality, this finalizer's
+# seat, mining and its balance, the headless wallet and its stakes, one
+# screen, read from the host, changing nothing. The chain's calendar, for the
+# two scripts: the protocol's values are one chain's.
+- name: Write chain.env
+  ansible.builtin.template:
+    src: chain.env.j2
+    dest: "{{ crosslink_config_dir }}/chain.env"
+    owner: root
+    group: "{{ crosslink_user }}"
+    mode: "0644"
+  tags: [stake]
+
+- name: Install crosslink-check
+  ansible.builtin.copy:
+    src: crosslink-check
+    dest: /usr/local/bin/crosslink-check
+    owner: root
+    group: root
+    mode: "0755"
+  tags: [stake]
+
+# ─── The stake script ────────────────────────────────────────────────────────
+# `sudo crosslink-stake`: stakes the host's rewards. Only a host with the
+# wallet on can stake, so only that host gets it. The playbook installs it and
+# never runs it: an operator does, by hand, or the script's own timer does.
+# The timer is on while crosslink_autostake_to names a finalizer address.
+- name: Install crosslink-stake
+  ansible.builtin.copy:
+    src: crosslink-stake
+    dest: /usr/local/bin/crosslink-stake
+    owner: root
+    group: root
+    mode: "0755"
+  register: stake_script_copy
+  when: not crosslink_disable_wallet | bool
+  tags: [stake]
+
+# A node restart under a stake pass loses the stake the wallet is building. So
+# the restart a run notified happens here, between passes, not at the end of
+# the play. Every host, no `when`: a `meta` task reads a `when` from the first
+# host of the play only (ansible-doc meta). README.md, "Finalizer".
+- name: Find the stake timer
+  ansible.builtin.stat:
+    path: /etc/systemd/system/crosslink-stake.timer
+  register: stake_timer_unit
+  tags: [stake]
+
+- name: Hold the stake timer while the node restarts
+  ansible.builtin.systemd_service:
+    name: crosslink-stake.timer
+    state: stopped
+  changed_when: false # "Resume the stake timer" puts it back
+  when: stake_timer_unit.stat.exists
+  tags: [stake]
+
+# A pass is a oneshot service: "activating" while it runs.
+- name: Wait for a stake pass in flight to end (up to 5 min)
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, ActiveState, --value, crosslink-stake.service]
+  register: stake_pass
+  until: stake_pass.stdout in ['inactive', 'failed']
+  retries: 60
+  delay: 5
+  changed_when: false
+  when: stake_timer_unit.stat.exists
+  tags: [stake]
+
+- name: Restart the node now, not at the end of the play
+  ansible.builtin.meta: flush_handlers
+  tags: [stake]
+
+# The node opens its RPC once the state is loaded. A pass before that says
+# "Not now", and the next one is crosslink_autostake_every_minutes later.
+- name: Wait for the node's RPC (up to 5 min)
+  ansible.builtin.uri:
+    url: "http://{{ crosslink_rpc_listen }}/"
+    method: POST
+    body_format: json
+    body: {"jsonrpc": "1.0", "id": "wait", "method": "getblockcount", "params": []}
+  register: node_rpc_wait
+  until: node_rpc_wait.status == 200
+  retries: 60
+  delay: 5
+  ignore_errors: true
+  when:
+    - not crosslink_disable_wallet | bool
+    - crosslink_autostake_to | length > 0
+  tags: [stake]
+
+- name: Resume the stake timer
+  ansible.builtin.systemd_service:
+    name: crosslink-stake.timer
+    state: started
+  changed_when: false
+  when:
+    - stake_timer_unit.stat.exists
+    - not crosslink_disable_wallet | bool
+    - crosslink_autostake_to | length > 0
+  tags: [stake]
+
+- name: Check the address the stake timer stakes to
+  ansible.builtin.assert:
+    that: crosslink_autostake_to is match('^zfinv1[A-Za-z0-9_-]{128}$')
+    fail_msg: >-
+      crosslink_autostake_to is not a finalizer address (zfinv1 + 128 characters).
+      Copy it from the finalizer's log: grep 'finalizer address'.
+  when:
+    - not crosslink_disable_wallet | bool
+    - crosslink_autostake_to | length > 0
+  tags: [stake]
+
+- name: Install the stake timer
+  ansible.builtin.command:
+    argv: >-
+      {{ ['/usr/local/bin/crosslink-stake', '--to', crosslink_autostake_to,
+          '--timer', 'install',
+          '--min', crosslink_autostake_min | string,
+          '--every', crosslink_autostake_every_minutes | string]
+         + (['--reference', crosslink_autostake_reference] if crosslink_autostake_reference else [])
+         + (['--dry-run'] if crosslink_autostake_dry_run | bool else []) }}
+  register: stake_timer
+  changed_when: "'Unchanged' not in stake_timer.stdout"
+  when:
+    - not crosslink_disable_wallet | bool
+    - crosslink_autostake_to | length > 0
+  tags: [stake]
+
+# The timer runs the script at /usr/local/bin, so a new script needs no new
+# timer; it needs a pass, so it stakes in this Staking Day and not at the
+# next tick. A rewritten timer starts one itself (the task above); a new
+# script under an unchanged timer gets it here.
+- name: Run a stake pass now, with the new script
+  ansible.builtin.systemd_service:
+    name: crosslink-stake.service
+    state: started
+    no_block: true
+  when:
+    - not crosslink_disable_wallet | bool
+    - crosslink_autostake_to | length > 0
+    - stake_script_copy is changed
+    - stake_timer is not changed
+  tags: [stake]
+
+- name: Find the stake script on a host that gets no stake timer
+  ansible.builtin.stat:
+    path: /usr/local/bin/crosslink-stake
+  register: stake_script
+  when: crosslink_disable_wallet | bool or crosslink_autostake_to | length == 0
+  tags: [stake]
+
+- name: Remove the stake timer
+  ansible.builtin.command:
+    argv: [/usr/local/bin/crosslink-stake, --timer, remove]
+  register: stake_timer_gone
+  changed_when: "'Removed' in stake_timer_gone.stdout"
+  when:
+    - crosslink_disable_wallet | bool or crosslink_autostake_to | length == 0
+    - stake_script.stat.exists
+  tags: [stake]
+
+- name: Remove crosslink-stake from a host with the wallet off
+  ansible.builtin.file:
+    path: /usr/local/bin/crosslink-stake
+    state: absent
+  when: crosslink_disable_wallet | bool
+  tags: [stake]

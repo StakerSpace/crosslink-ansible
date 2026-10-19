@@ -1,0 +1,16 @@
+# Crosslink node keys
+
+Written by crosslink-ansible on {{ ansible_date_time.iso8601 }}.
+
+One directory per node. A miner's holds its `secret.seed`: its identity, its wallet seed, and without a payout address, the only key to its rewards. An RPC node's holds the record only; its seed protects nothing and stays on the host.
+
+Start with [FLEET.md](FLEET.md), then each host's `NODE-CARD.md`. `FLEET.md` lists every host with a directory here, whether or not it was in the last run. A miner's `rewards.json` is what its payout address had received at the last run; `ansible-playbook -i inventory.yml rewards.yml` reads it again.
+
+## Do this
+
+- **Back it up somewhere else.** This directory is one copy on one machine.
+- **Encrypt the backup** (`age`, `gpg`, a password manager).
+- **Test a restore** on a scratch host. `NODE-CARD.md` has the steps.
+- **Never commit this directory.**
+
+Re-running the playbook rewrites these files from what the hosts report. It never writes a seed to a host.

@@ -1,0 +1,15 @@
+---
+# ansible-lint settings. The rules skipped are style rules this tree does not
+# follow on purpose: variables are named after what they hold, not after the
+# role; the shell pipes that matter set pipefail; the few systemctl reads have
+# no module equivalent (is-active as a string, show -p); long lines are the
+# messages a failing check prints, kept on one line so they are greppable.
+profile: basic
+skip_list:
+  - var-naming[no-role-prefix]
+  - run-once[task]
+  - risky-shell-pipe
+  - command-instead-of-module
+  - yaml[line-length]
+exclude_paths:
+  - .github/

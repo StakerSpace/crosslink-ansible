@@ -1,0 +1,56 @@
+---
+# One index for every host with a record in the key bundle, not only the hosts
+# in this run: `-l miner` must not drop another host's row. Runs once, on the
+# control machine, from the identity.json files the directories hold.
+
+- name: Find host records
+  ansible.builtin.find:
+    paths: "{{ crosslink_keys_dir }}"
+    patterns: identity.json
+    recurse: true
+    depth: 2
+  register: fleet_found
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  run_once: true
+
+- name: Read host records
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: "{{ fleet_found.files | map(attribute='path') | sort }}"
+  loop_control:
+    label: "{{ item | dirname | basename }}"
+  register: fleet_read
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  run_once: true
+
+- name: Set fleet facts
+  ansible.builtin.set_fact:
+    fleet_hosts: "{{ fleet_read.results | map(attribute='content') | map('b64decode') | map('from_json') | sort(attribute='host') }}"
+  run_once: true
+
+- name: Write FLEET.md and README.md
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ crosslink_keys_dir }}/{{ item.dest }}"
+    mode: "0600"
+  loop:
+    - { src: FLEET.md.j2, dest: FLEET.md }
+    - { src: README.md.j2, dest: README.md }
+  loop_control:
+    label: "{{ item.dest }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  run_once: true
+
+- name: Show key bundle location
+  ansible.builtin.debug:
+    msg: "Key bundle written to {{ crosslink_keys_dir }} (start with FLEET.md). Back it up and encrypt it."
+  run_once: true

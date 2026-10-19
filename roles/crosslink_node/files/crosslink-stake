@@ -1,0 +1,1350 @@
+#!/usr/bin/env python3
+"""Stake this host's mining rewards to a finalizer. The one call here that spends.
+
+    sudo crosslink-stake --to ADDRESS --amount 100  stake 100 cTAZ
+    sudo crosslink-stake --to ADDRESS --all             stake every spendable reward but --keep
+    sudo crosslink-stake --to ADDRESS --all --dry-run   run every check, send nothing
+    sudo crosslink-stake --to ADDRESS --all --wait      wait for Staking Day instead of stopping
+    sudo crosslink-stake --to ADDRESS --all --yes       no question, for a timer
+    sudo crosslink-stake --to ADDRESS --all --batch 500 stakes of at most 500 cTAZ each
+    sudo crosslink-stake --to ADDRESS --auto            what a timer runs: --all --yes, and
+                                                    "not now" is not a failure
+    sudo crosslink-stake --to ADDRESS --timer install   stake by itself from now on (below)
+
+ADDRESS is a finalizer address, `zfinv1` + 128 characters: the one the
+finalizer's node logs at start ("finalizer address:"). Self-describing: the
+node refuses one that does not verify. A finalizer need not be on the active
+roster to be staked to (only the largest N vote), so the seat is reported,
+never required.
+
+For a node host that crosslink-ansible built with the headless wallet on
+(`crosslink_disable_wallet: false`). The playbook installs it there and never
+runs it. A node run by hand points it at its own files with the CROSSLINK_*
+variables below. Standard library only.
+
+Before it sends, it checks, and stops at the first check that fails:
+
+  1. the wallet is on and has started, and the rewards are this wallet's:
+     no miner_address, or miner_address is this wallet's own unified
+     address (rewards shielded, below)
+  2. the node is synced and on the network's chain: the last finalized
+     block is in this node's chain, read from its own RPC (--reference URL
+     also compares the block at an explorer's tip)
+  3. no earlier stake from this script is still waiting for a block
+  4. the address decodes
+  5. Staking Day is open, with 15 blocks to spare, and the chain is past the
+     first block a stake is valid at (v14: 20,736)
+  6. the wallet has read the chain up to the tip: its notes
+     (wallet_spendable_funds, the wallet's own tip) and the payout address
+  7. the amount is there: the wallet's spendable shielded notes (its own
+     rule, 3 confirmations) plus the payout address's rewards older than
+     10 blocks
+
+Rewards shielded. zebrad takes any address of the chain as miner_address,
+and a unified address with an Orchard receiver is paid its reward as one
+Ironwood note a block (v14 zebra-rpc, `new_coinbase`). The headless wallet's
+own unified address is printed at start ("USER WALLET ADDRESS:") and answered
+by wallet_spendable_funds; with miner_address set to it the rewards land in
+this wallet as shielded notes, and the wallet builds every stake from its
+Ironwood notes first and transparent coins after (wallet/src/lib.rs,
+`stake_ironwood_to_finalizer`, src_pools), so such a stake has no transparent
+input and no address the chain can read it by. The playbook sets it with
+crosslink_miner_shielded. This script stakes either way, and both kinds of
+reward count: a host that switched keeps what its payout address held.
+
+It stakes in batches of at most --batch cTAZ (1,000 by default), one stake
+at a time: the wallet pays a stake with the rewards one coin or note each (a
+block's reward is one note), and a stake of 8,925 cTAZ in about 1,785 coins
+was built and then refused by the node's own mempool. It asks once for the
+whole amount, then before each stake after the first it waits until the one
+before is in a block and the wallet has read that block, so no coin is
+offered twice, and runs every check above again. A batch that stops leaves
+the ones before it staked; run it again for the rest.
+
+Every stake is a power of 10 zats: 1, 10, 100, 1,000 … cTAZ (0.1 and 0.01
+too). Consensus asks it from block 55,296 of the Feature Net (v15's
+FeaturenetUpgrade1), and the v15 wallet refuses any other amount at every
+height, before that block too (wallet/src/lib.rs,
+`stake_ironwood_to_finalizer`). Earlier builds take any amount, so such a
+stake is valid on every build, and the script stakes no other kind: it does
+not depend on reading which build it talks to. --all is staked as such
+pieces, largest first, none over --batch and none under --min rounded down to
+a power of 10 (50 → 10), and what is left under the smallest piece waits for
+a later pass; a --amount that is not one of those is refused.
+
+The wallet answers every refusal with the same words ("failed to create
+staking transaction from notes") and prints its reason in the node's log; the
+script reads that line back and says it, with what to do about it.
+
+The reply is written to disk before anything reads it. v15's
+wallet_staking_action answers with the transaction id; a build without it
+(v14) takes the same request through staking_command, which answers with no
+id, and then the id is read from the node's log, where the wallet prints the
+stake it built. The wallet derives the bond key from the seed, and the script
+finds the stake by its id in wallet_staking_positions once its block is read,
+and writes the key to the ledger then. Every attempt, a failure too, is a line in the ledger. A timeout
+is not a failure: the stake may still land, so it never sends again by
+itself. A stake the wallet built is valid for 40 blocks; one not in a block
+by then is given up, once the wallet has read that far, and the next run
+stakes again. Every line names the chain (NETWORK in chain.env), and a line
+from another chain — a host reset from one season to the next keeps its
+ledger — is left alone, as is one sent at a block above this chain's tip.
+
+Exit: 0 sent, or nothing to stake · 1 a check stopped it, or the node
+refused · 3 no reply in time; the stake may still land.
+
+Staking by itself. `--timer install` writes a systemd service and timer that
+run this file with --auto every 30 minutes (--every), restarts the timer and
+starts a pass at once (a changed address, minimum or script is in force in
+this Staking Day, not the next tick's; a timer already as asked is left
+alone), and `--timer remove` takes them away; `--timer status` shows the next run, the last one and the
+last stake, `--timer show` prints the two units and changes nothing. Run as
+root it is a system timer, otherwise a user timer (systemctl --user). The
+units carry --to, --min, --keep, --batch, --reference and --dry-run as given
+at install, and every CROSSLINK_* variable set then, so a node run by hand
+installs it through the same wrapper it stakes with. Nothing but this file is
+needed on the host. crosslink-ansible runs this same install on a host whose
+inventory sets crosslink_autostake_to, and never stakes itself.
+
+With --auto every check above still runs on every pass. A check that passes by
+itself later (Staking Day closed, the node syncing, the wallet reading, an
+earlier stake not in a block yet) ends the pass with exit 0; anything else is
+exit 1 and the unit shows failed. --min is what keeps the bonds few: a pass
+stakes only once that much has gathered (10 cTAZ unless given at install).
+--keep is what stays behind for the fee: 1 cTAZ, where a stake's fee is
+5,000 zats a coin it spends (ZIP-317), 0.01 cTAZ for a stake of 1,000.
+Install it with --dry-run first to watch a Staking Day go by with nothing
+sent. Before finality starts on a chain that begins as proof-of-work, only
+--reference can see a fork.
+"""
+import argparse
+import base64
+import calendar
+import fcntl
+import http.client
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+CONFIG = os.environ.get("CROSSLINK_STAKE_CONFIG", "/etc/crosslink/zebrad.toml")
+HOST_README = os.environ.get("CROSSLINK_STAKE_HOST_README", "/etc/crosslink/README.md")
+NODE_UNIT = os.environ.get("CROSSLINK_STAKE_UNIT", "crosslink-node")
+STAKE_DIR = os.environ.get("CROSSLINK_STAKE_DIR", "/var/lib/crosslink-stake")
+# the chain's calendar, written by the playbook
+CHAIN_ENV = os.environ.get("CROSSLINK_CHAIN_ENV", "/etc/crosslink/chain.env")
+# a node run by hand: its log file(s) instead of the journal (paths joined by
+# ":"; a line without a time of its own is dated by its file), a user unit
+LOG_FILES = [x for x in os.environ.get("CROSSLINK_STAKE_LOG", "").split(":") if x]
+USER_UNIT = bool(os.environ.get("CROSSLINK_STAKE_USER_UNIT"))
+JOURNALCTL = "journalctl --user" if USER_UNIT else "journalctl"
+ISO = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z")
+AGENT = {"User-Agent": "crosslink-stake"}      # Cloudflare refuses Python's own (error 1010)
+ZATS = 100_000_000
+MARGIN = 15          # blocks Staking Day must still have: a stake sent late lands after it closes
+SETTLE = 10          # rewards younger than this are not counted (the build's maturity is 2;
+                     # its coin picker does not skip young coins, so leave room)
+EXPIRY = 40          # blocks a stake is valid for after the wallet builds it (librustzcash's
+                     # DEFAULT_TX_EXPIRY_DELTA): past that it cannot land
+PENDING = EXPIRY + 5 # blocks past the height a stake was sent at before it is given up: the
+                     # expiry, and a few blocks for the send having taken longer than the plan
+RPC_TIMEOUT = 300    # the node answers a stake only once it is built and sent
+SYNC_LAG = 12        # blocks the node may be under getblockchaininfo's estimatedheight and
+                     # still be synced: zebra projects that figure from the tip block's time
+                     # at the 25 s target spacing (NetworkChainTipHeightEstimator), so a
+                     # quiet five minutes reads as 12 blocks "behind" on a synced node
+
+
+class Stop(Exception):
+    """A check failed. `what` says why, `next` what to do; `wait` marks one --wait can
+    outlast, and `day` one only --wait outlasts: between batches the others pass by themselves."""
+
+    def __init__(self, what: str, next: str = "", wait: bool = False, day: bool = False):
+        super().__init__(what)
+        self.what, self.next, self.wait, self.day = what, next, wait, day
+
+
+# ─── plumbing ────────────────────────────────────────────────────────────────
+
+def sh(*cmd: str, timeout: int = 30) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def journal_last(pattern: str, lines: int | None = 200_000) -> tuple[float | None, str]:
+    """The newest journal line of the node matching `pattern`, with its time.
+    With --reverse, `-n 1` stops journalctl at the first match; piping into
+    head does not, since journalctl block-buffers into a pipe and reads on
+    until about 8 KB of matches (a line printed once at start, through every
+    earlier run: 19.5 s against 0.07 s on a 1 GB journal). A pattern that is
+    not there is still a read of the whole journal, which is why a line the
+    node prints once at start goes through journal_first. `lines` bounds
+    only a read of LOG_FILES; None reads the whole file."""
+    if LOG_FILES:
+        best: tuple[float | None, str] = (None, "")
+        for path in LOG_FILES:
+            q = json.dumps(path)
+            src = f"tail -n {lines} {q} | tac" if lines else f"tac {q}"
+            line = sh("bash", "-c", f"{src} 2>/dev/null | grep -m 1 -aE {json.dumps(pattern)}",
+                      timeout=120).strip()
+            if not line:
+                continue
+            m = ISO.match(line)
+            try:
+                when = (float(calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")))
+                        if m else os.path.getmtime(path))
+            except OSError:
+                when = None
+            if best[0] is None or (when is not None and when > best[0]):
+                best = (when, line)
+        return best
+    out = sh("bash", "-c",
+             f"{JOURNALCTL} -u {NODE_UNIT} -r -n 1 -o short-unix --no-pager "
+             f"--grep {json.dumps(pattern)} 2>/dev/null", timeout=60).strip()
+    stamp, _, rest = out.partition(" ")
+    try:
+        return float(stamp), rest
+    except ValueError:              # "-- No entries --": this format says so on stdout
+        return None, ""
+
+
+def journal_first(pattern: str) -> str:
+    """The first line of the node's CURRENT run matching `pattern`, or "". For
+    what the node prints once at start (the payout address, the finalizer
+    address): journald seeks to the run's first entry by its invocation id and
+    the line is within the first few thousand, so this is a short read, where
+    a search back from the newest entry walks every template and solver line
+    the run has written since — over 30 s on a mining host a day old, which
+    is where a pass read "this build stakes to a key" off an empty answer.
+    On a log file the run starts at the top when the file was rotated at
+    start; else the whole file is read from its end."""
+    if LOG_FILES:
+        for path in LOG_FILES:
+            line = sh("bash", "-c", f"head -n 20000 {json.dumps(path)} 2>/dev/null | "
+                      f"grep -m 1 -aE {json.dumps(pattern)}").strip()
+            if line:
+                return line
+        return journal_last(pattern, lines=None)[1]
+    ctl = ["systemctl", "--user"] if USER_UNIT else ["systemctl"]
+    inv = sh(*ctl, "show", "-p", "InvocationID", "--value", NODE_UNIT).strip()
+    if inv:
+        line = sh("bash", "-c", f"{JOURNALCTL} -u {NODE_UNIT} _SYSTEMD_INVOCATION_ID={inv} -o cat "
+                  f"--no-pager 2>/dev/null | head -n 20000 | grep -m 1 -aE {json.dumps(pattern)}",
+                  timeout=60).strip()
+        if line:
+            return line
+    return journal_last(pattern, lines=None)[1]
+
+
+def readme_row(name: str) -> str:
+    """The value of a row of the host summary (`| name | `value` |`), or "".
+    The playbook writes it on every run, so it holds the lines the node
+    printed at a start the journal has rotated past."""
+    try:
+        text = open(HOST_README, encoding="utf-8").read()
+    except OSError:
+        return ""
+    m = re.search(rf"\| {re.escape(name)} \| `([^`]+)` \|", text)
+    return m.group(1) if m else ""
+
+
+class Rpc:
+    def __init__(self, url: str):
+        self.url = url
+
+    def body(self, method: str, params) -> bytes:
+        return json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                           "params": params if params is not None else []}).encode()
+
+    def raw(self, method: str, params=None, timeout: float = 20) -> bytes:
+        req = urllib.request.Request(self.url, data=self.body(method, params),
+                                     headers={"content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as err:       # zebra answers an RPC error with a status
+            return err.read()
+
+    def __call__(self, method: str, params=None):
+        """The result. Raises Stop when the node does not answer or answers an error."""
+        try:
+            reply = json.loads(self.raw(method, params))
+        except (urllib.error.URLError, OSError, ValueError) as err:
+            raise Stop(f"the node's RPC does not answer {method}: {err}",
+                       f"{'systemctl --user' if USER_UNIT else 'systemctl'} status {NODE_UNIT}",
+                       wait=True)
+        if reply.get("error"):
+            raise Stop(f"{method}: {reply['error'].get('message', reply['error'])}")
+        return reply.get("result")
+
+
+def ctaz(zats: int) -> str:
+    return f"{zats / ZATS:,.3f} cTAZ"
+
+
+def short(key: str) -> str:
+    return f"{key[:8]}…{key[-4:]}"
+
+
+def rev(key: str) -> str:
+    return bytes.fromhex(key)[::-1].hex()
+
+
+def finalizer_key(address: str) -> str | None:
+    """The 32-byte BFT key inside a finalizer address, as hex — or None."""
+    if not address.startswith("zfinv1") or len(address) != 134:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(address[6:])
+    except ValueError:
+        return None
+    return raw[:32].hex() if len(raw) == 96 else None
+
+
+def chain_env() -> dict:
+    env = {}
+    env.update(read_env(CHAIN_ENV))
+    return env
+
+
+def wallet_funds(rpc: Rpc) -> dict | None:
+    """wallet_spendable_funds: the wallet's own unified address, its shielded
+    notes it can spend now (3 confirmations), the ones too young, the ones a
+    send of its own has consumed, and the tip it has read to. None on a build
+    without the call, or a wallet that has not finished its first pass."""
+    try:
+        got = rpc("wallet_spendable_funds")
+    except Stop:
+        return None
+    return got if isinstance(got, dict) and got.get("address") else None
+
+
+def own_wallet_address(rpc: Rpc) -> str:
+    """This wallet's own unified address: answered by wallet_spendable_funds
+    once the wallet has made a pass, printed at start before that, and kept
+    in the host summary."""
+    funds = wallet_funds(rpc)
+    if funds:
+        return str(funds["address"])
+    line = journal_first("USER WALLET ADDRESS: +u[a-z0-9]{20,}")
+    m = re.search(r"USER WALLET ADDRESS: +(u[a-z0-9]{20,})", line)
+    return m.group(1) if m else readme_row("wallet address")
+
+
+
+def read_env(path: str) -> dict:
+    env = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return env
+
+
+def say(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+# ─── the ledger ──────────────────────────────────────────────────────────────
+
+def stake_dir() -> str:
+    os.makedirs(STAKE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(STAKE_DIR, 0o700)
+    return STAKE_DIR
+
+
+def ledger_add(entry: dict) -> None:
+    path = os.path.join(stake_dir(), "ledger.jsonl")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def network() -> str:
+    """The chain this node is on, as the playbook names it (NETWORK in chain.env);
+    "" on a node run by hand without one."""
+    return str(chain_env().get("NETWORK") or "")
+
+
+def ledger_last() -> dict | None:
+    """The newest stake in the ledger that is this chain's. A line written on
+    another chain (a host reset from one network to the next keeps its ledger) names
+    a network that is not this one, or none and a block this chain has not
+    reached; such a stake can never land here and must not hold a new one."""
+    try:
+        lines = open(os.path.join(STAKE_DIR, "ledger.jsonl"), encoding="utf-8").read().splitlines()
+    except OSError:
+        return None
+    here = network()
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("outcome") not in ("sent", "timeout", "landed"):
+            continue
+        if here and entry.get("network") and entry["network"] != here:
+            continue
+        return entry
+    return None
+
+
+def ledger_keys() -> set:
+    """Every bond key the ledger knows, as written."""
+    try:
+        lines = open(os.path.join(STAKE_DIR, "ledger.jsonl"), encoding="utf-8").read().splitlines()
+    except OSError:
+        return set()
+    keys = set()
+    for line in lines:
+        try:
+            keys.add(json.loads(line).get("bond_key"))
+        except ValueError:
+            continue
+    return keys - {None}
+
+
+def find_position(rpc: Rpc, entry: dict) -> dict | None:
+    """The stake of a ledger entry that has no bond key, among the wallet's
+    positions: the one created by the entry's transaction when the ledger has
+    its id, else same finalizer, same amount, created at or after the block it
+    was sent at, and not a bond the ledger already names. v14's stake call
+    (staking_command) answers with no bond key, and the wallet lists a stake
+    once its block is read, so this is also how such a stake is seen to land."""
+    try:
+        positions = rpc("wallet_staking_positions")
+    except Stop:
+        return None
+    if not isinstance(positions, dict):
+        return None
+    want, known = str(entry.get("to_roster_key") or "").lower(), ledger_keys()
+    txid = str(entry.get("txid") or "").lower()
+    for finalizer, bonds in (positions.get("active") or {}).items():
+        for b in bonds or []:
+            if txid and str(b.get("create_txid") or "").lower() == txid and b.get("pk"):
+                return b
+    if txid:
+        return None
+    for finalizer, bonds in (positions.get("active") or {}).items():
+        try:
+            if want not in (finalizer.lower(), rev(finalizer.lower())):
+                continue
+        except ValueError:
+            continue
+        for b in bonds or []:
+            try:
+                if (int(b.get("initial_val", -1)) == int(entry.get("amount_zats", 0))
+                        and int(b.get("create_height", 0)) >= int(entry.get("height", 0))
+                        and b.get("pk") and b["pk"] not in known):
+                    return b
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def ledger_txids() -> set:
+    try:
+        lines = open(os.path.join(STAKE_DIR, "ledger.jsonl"), encoding="utf-8").read().splitlines()
+    except OSError:
+        return set()
+    ids = set()
+    for line in lines:
+        try:
+            ids.add(json.loads(line).get("txid"))
+        except ValueError:
+            continue
+    return ids - {None}
+
+
+def built_txid() -> str | None:
+    """The id of the stake the wallet built last, off the node's log: a call
+    that answers with no bond key names no transaction either, but the wallet
+    prints the one it built ("RPC staking progress: <built>, … TxId(…)"). The
+    newest such line is this stake's, since the wallet builds one at a time;
+    one the ledger already has is an earlier stake's, and is not taken."""
+    line = journal_last(r'RPC staking progress: <built>.*TxId\("[0-9a-f]{64}"\)')[1]
+    m = re.search(r'TxId\("([0-9a-f]{64})"\)', line)
+    if not m or m.group(1) in ledger_txids():
+        return None
+    return m.group(1)
+
+
+# What the wallet prints when it refuses to build a staking action (v15,
+# wallet/src/lib.rs: the stake's own checks, then send_zats). The RPC answers
+# each of them with the same "failed to create staking transaction from notes".
+REFUSAL = (r"stake_ironwood_to_finalizer: |tx build refused: |tx build staking action error|"
+           r"tx build error|build error: |tried to send from transparent|couldn't get anchor|"
+           r"Could not find bond")
+
+
+def wallet_reason(since: float, amount: int) -> list[str]:
+    """The wallet's own words for a refusal, off the node's log from `since`
+    on, the specific ones first. The shared "miner" wallet tries to shield 10
+    cTAZ every 15 seconds and prints "can't afford" while it has less, so a
+    "can't afford" line counts only when its sum is this stake's amount and a
+    fee under 1 cTAZ (for a stake of 10 cTAZ the shield's line can pass: it is
+    shown last, after anything more specific)."""
+    time.sleep(1)                   # the line is printed just before the reply; let it reach the log
+    if LOG_FILES:
+        # 2,000 lines is a few minutes of a node's log; println lines carry no time
+        text = "\n".join(sh("bash", "-c", f"tail -n 2000 {json.dumps(path)} 2>/dev/null | "
+                            f"grep -aE {json.dumps(REFUSAL)}") for path in LOG_FILES)
+    else:
+        text = sh("bash", "-c", f"{JOURNALCTL} -u {NODE_UNIT} --since @{int(since) - 2} -o cat "
+                  f"--no-pager --grep {json.dumps(REFUSAL)} 2>/dev/null", timeout=60)
+    specific, afford = [], []
+    for line in (x.strip()[:300] for x in text.splitlines()):
+        m = re.search(r"can't afford (\d+)", line)
+        if m:
+            if amount <= int(m.group(1)) < amount + ZATS and line not in afford:
+                afford.append(line)
+        elif line and line not in specific:
+            specific.append(line)
+    return specific + afford
+
+
+def landed(entry: dict, position: dict) -> int:
+    """Write down the bond found for `entry`, and return its block."""
+    block = int(position.get("create_height", 0))
+    ledger_add({"utc": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), "outcome": "landed",
+                "of": entry.get("utc"), "height": block, "bond_key": position["pk"],
+                "txid": position.get("create_txid") or entry.get("txid"),
+                "amount_zats": entry.get("amount_zats"),
+                "to_roster_key": entry.get("to_roster_key"), "network": network()})
+    return block
+
+
+def save_reply(body: bytes, stamp: str) -> str:
+    """The reply on disk, synced, before any byte of it is parsed. Never
+    overwrites an earlier reply; if the disk refuses, the reply goes to the
+    terminal, because the bond key in it exists nowhere else."""
+    try:
+        for n in range(1000):
+            path = os.path.join(stake_dir(), f"bond-{stamp}{f'-{n}' if n else ''}.json")
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            return path
+        raise OSError("no free file name")
+    except OSError as err:
+        say(f"COULD NOT SAVE THE REPLY ({err}). Copy it now, it holds the bond key:")
+        say(body.decode(errors="replace"))
+        return "(not saved: printed above)"
+
+
+# ─── the checks ──────────────────────────────────────────────────────────────
+
+def wallet_and_payout(rpc: Rpc, cfg: dict) -> dict:
+    """The wallet is on and started, and the rewards are its own: {"t": the
+    payout address (None when not logged), "ua": the wallet's own unified
+    address (None before its first pass on a build without the log line),
+    "shielded": whether miner_address pays the rewards to that address}."""
+    if cfg.get("crosslink", {}).get("disable_the_headless_wallet", True):
+        raise Stop("the headless wallet is off, and only the wallet can build a stake",
+                   "set crosslink_disable_wallet: false under this host in the inventory, "
+                   "then run site.yml -l <host>")
+    if not rpc("get_wallet_ufvk"):
+        raise Stop("the wallet has not started yet", "wait a minute and run it again", wait=True)
+    configured = str(cfg.get("mining", {}).get("miner_address") or "")
+    ua = own_wallet_address(rpc) or None
+    shielded = False
+    if configured:
+        if ua and configured == ua:
+            shielded = True
+        elif not ua:
+            raise Stop(f"rewards go to {configured} (miner_address), and the wallet has not said "
+                       "its own address yet, so this script cannot tell whether that is this wallet",
+                       "wait for the wallet's first pass and run it again", wait=True)
+        else:
+            raise Stop(f"rewards go to {configured} (crosslink_miner_address), not to this "
+                       "node's own wallet, so the wallet has no rewards to stake",
+                       "stake from the wallet that holds that address, or set "
+                       "crosslink_miner_shielded: true to pay them to this wallet, shielded")
+    # the wallet prints its transparent address at start ("USER WALLET
+    # T-ADDRESS:"); zebrad logs "Miner address unspecified. Mining to t…" at
+    # every start only while no miner_address is set; the host summary keeps
+    # a copy for a journal that has rotated past both
+    line = journal_first("USER WALLET T-ADDRESS: +t[1-9A-HJ-NP-Za-km-z]{20,}")
+    m = re.search(r"T-ADDRESS: +(t[1-9A-HJ-NP-Za-km-z]{20,})", line)
+    if not m:
+        line = journal_first("Mining to t[1-9A-HJ-NP-Za-km-z]{20,}")
+        m = re.search(r"Mining to (t[1-9A-HJ-NP-Za-km-z]{20,})", line)
+    address = m.group(1) if m else readme_row("payout address")
+    if not re.fullmatch(r"t[1-9A-HJ-NP-Za-km-z]{20,}", address):
+        if not shielded:
+            raise Stop("the payout address is not in the node's log or in " + HOST_README,
+                       "run site.yml -l <host> once; the host summary records it")
+        address = None
+    return {"t": address, "ua": ua, "shielded": shielded}
+
+
+def finalized_in_chain(rpc: Rpc, height: int, log) -> None:
+    """The block the finalizers last finalized must be in this node's chain.
+    It sees a fork older than that block; a younger one needs --reference."""
+    final = rpc("get_tfl_final_block_height_and_hash") or {}
+    fh, raw = final.get("height"), final.get("hash")
+    if fh is None or raw is None:
+        # the only fork check unless --reference is given, so it does not skip
+        raise Stop("the node does not report its last finalized block",
+                   "wait a minute and run it again", wait=True)
+    # RPCs give a hash as hex or as 32 numbers, and in either byte order
+    want = bytes(raw).hex() if isinstance(raw, list) else str(raw).lower()
+    ours = str(rpc("getblockhash", [int(fh)])).lower()
+    if ours not in (want, rev(want) if len(want) == 64 else want):
+        raise Stop(f"the last finalized block, {int(fh):,}, is not in this node's chain: "
+                   "this node is on a fork", "see CALLS.md, \"Check for a fork\"")
+    gap = height - int(fh)
+    log(f"  the last finalized block, {int(fh):,}, is in this node's chain")
+    if gap > 20:
+        # a stake now sits in blocks nobody has finalized yet
+        log(f"  note: finality is {gap} blocks behind the tip: nothing after block {int(fh):,} "
+            "is final yet")
+
+
+def synced_and_on_chain(rpc: Rpc, reference: str | None, log) -> int:
+    info = rpc("getblockchaininfo") or {}
+    height, estimated = info.get("blocks"), info.get("estimatedheight")
+    if height is None:
+        raise Stop("the node does not report its height")
+    if estimated is not None and int(height) < int(estimated) - SYNC_LAG:
+        raise Stop(f"the node is syncing: block {height:,} of about {int(estimated):,}",
+                   "wait until it is synced", wait=True)
+    try:
+        activation = int(chain_env().get("BFT_ACTIVATION_BLOCK", 0) or 0)
+    except ValueError:
+        activation = 0
+    if activation and int(height) < activation:
+        # a chain that bootstraps from pure proof-of-work: nothing is finalized
+        # before this block, so finality cannot tell a fork here
+        log(f"  finality starts at block {activation:,}; no finalized block to check against yet")
+    else:
+        finalized_in_chain(rpc, int(height), log)
+    if reference is None:
+        log("  no explorer compared (--reference URL adds one): a fork younger than the last "
+            "finalized block would not show")
+        return int(height)
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(reference, headers=AGENT)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                ref = json.load(r)
+            ref_tip, ref_hash = int(ref["tip"]), str(ref["tip_hash"]).lower()
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as err:
+            raise Stop(f"the explorer at {reference} did not answer ({err})",
+                       "run it again later, or leave --reference out to go on with this node's "
+                       "own check only, which cannot see a fork younger than the last finalized block")
+        height = int(rpc("getblockcount"))
+        if height >= ref_tip:
+            ours = str(rpc("getblockhash", [ref_tip])).lower()
+            if ours != ref_hash:
+                raise Stop(f"block {ref_tip:,} here is {ours[:16]}…, the explorer's is "
+                           f"{ref_hash[:16]}…: this node or the explorer is on a fork",
+                           "see CALLS.md, \"Check for a fork\"")
+            return height
+        time.sleep(15)          # the explorer saw a block this node has not yet
+    raise Stop(f"this node is at block {height:,}, the explorer at {ref_tip:,}",
+               "wait until it catches up", wait=True)
+
+
+def no_stake_pending(rpc: Rpc, payout: dict, height: int, log) -> None:
+    """Coins spent by a stake still in the mempool look unspent to the chain
+    reads below; staking again would try to spend them twice. A stake is
+    given up only once the chain is past its expiry and the wallet has read
+    that far: until then a block the wallet has not read yet may hold it."""
+    last = ledger_last()
+    if not last:
+        return
+    if last.get("outcome") == "landed":
+        return
+    sent_at = int(last.get("height", 0))
+    if sent_at > height:
+        # a ledger line without a network name, from a chain this node is no
+        # longer on: no block of this chain can hold it
+        log(f"  note: the ledger's last stake was sent at block {sent_at:,}, above this "
+            f"chain's tip; it is another chain's and is left alone")
+        return
+    position = find_position(rpc, last)
+    if position:
+        block = landed(last, position)
+        log(f"  the stake sent at block {sent_at:,} is in block {block:,}")
+        return
+    quiet = last.get("outcome") == "sent"     # the node answered; a timeout did not
+    if height - sent_at < PENDING:
+        if quiet:
+            raise Stop(f"the stake sent at block {sent_at:,} is not in a block yet",
+                       f"wait; after block {sent_at + PENDING:,} it is given up", wait=True)
+        raise Stop(f"the stake sent at block {sent_at:,} got no reply, and it may still land",
+                   "check wallet_staking_positions (CALLS.md); after block "
+                   f"{sent_at + PENDING:,} this check lets a new stake through", wait=True)
+    wallet_scanned(rpc, payout, height, sent_at + PENDING)
+    log(f"  note: the stake sent at block {sent_at:,} "
+        + ("never reached a block" if quiet else "got no reply")
+        + "; check wallet_staking_positions")
+
+
+def roster_seat(rpc: Rpc, address: str) -> dict:
+    """The seat of the finalizer the address names: its rank and stake on the
+    roster, or no rank. A finalizer outside the active roster, or before the
+    first roster exists, is still a valid target."""
+    roster = rpc("get_tfl_roster_zats") or []
+    ranked = sorted(roster, key=lambda r: -int(r.get("voting_power", 0)))
+    keys = [str(m.get("pub_key", "")).lower() for m in ranked]
+    inner = finalizer_key(address)
+    if not inner:
+        raise Stop("the address does not decode (zfinv1 + 128 base64url characters)",
+                   "copy it from the node's log: grep 'finalizer address'")
+    for form in (inner, rev(inner)):        # the roster lists a key in either byte order
+        if form in keys:
+            i = keys.index(form)
+            return {"rank": i + 1, "of": len(ranked), "stake": int(ranked[i].get("voting_power", 0))}
+    return {"rank": None, "of": len(ranked), "stake": 0}
+
+
+def is_power_of_10(n: int) -> bool:
+    while n > 0 and n % 10 == 0:
+        n //= 10
+    return n == 1
+
+
+def power_of_10_floor(n: int) -> int:
+    """The largest power of 10 at or under n; 0 under 1."""
+    return 10 ** (len(str(n)) - 1) if n >= 1 else 0
+
+
+def staking_day(height: int) -> dict:
+    env = chain_env()
+    try:
+        period = int(env.get("STAKING_PERIOD_BLOCKS", 150))
+        window = int(env.get("STAKING_WINDOW_BLOCKS", 70))
+        start = int(env.get("STAKING_START_BLOCK", 0) or 0)
+    except ValueError:
+        period, window, start = 150, 70, 0
+    if height < start:
+        raise Stop(f"no stake is valid before block {start:,} on this chain; "
+                   f"{start - height:,} blocks to go",
+                   "wait for it, or pass --wait", wait=True, day=True)
+    pos = height % period
+    if pos >= window - MARGIN:
+        opens = period - pos if pos >= window else None
+        raise Stop(f"Staking Day: block {pos} of {period}"
+                   + (f", open until block {window - 1}, too close to its end" if opens is None
+                      else f", closed; opens in {opens} blocks"),
+                   f"stake in blocks 0–{window - MARGIN - 1} of every {period}, or pass --wait",
+                   wait=True, day=True)
+    return {"pos": pos, "period": period, "window": window, "closes_in": window - pos}
+
+
+def wallet_scanned(rpc: Rpc, payout: dict, height: int, need: int | None = None) -> str:
+    """The wallet must have read the chain to the tip, on both sides. Its
+    notes: wallet_spendable_funds says the tip it has read to, and a note a
+    stake spent is still offered until the wallet has read that stake's
+    block. The payout address: the wallet reads it in ranges and logs each
+    one ("Downloading t txs in A-B for …/t…"); coins past B are unknown to
+    it, and so is the spending of a coin in a block past B. `need` is the
+    block with this run's last stake: until the wallet has read it, it would
+    offer the coins and notes that stake spent."""
+    said = []
+    funds = wallet_funds(rpc)
+    if funds:
+        tip = int(funds.get("tip_height") or 0)
+        if need is not None and tip < need:
+            raise Stop(f"the wallet has read its notes up to block {tip:,}, not yet block {need:,}",
+                       "wait until it has", wait=True)
+        if tip < height - 5:
+            raise Stop(f"the wallet has read its notes up to block {tip:,} of {height:,}",
+                       "wait until it catches up", wait=True)
+        said.append(f"the wallet has read its notes up to block {tip:,}")
+    elif payout["shielded"]:
+        raise Stop("the wallet has not finished its first pass (wallet_spendable_funds)",
+                   "wait a minute and run it again", wait=True)
+    address = payout.get("t")
+    if not address:
+        return said[0]
+    when, line = journal_last(f"Downloading t txs in [0-9]+-[0-9]+ for .*/{address}")
+    m = re.search(r"Downloading t txs in \d+-(\d+)", line)
+    if not m or when is None:
+        return ", ".join(said + ["the payout address's read position is not in the journal"])
+    upto, age = int(m.group(1)), time.time() - when
+    if upto >= max(height - 5, need or 0):
+        return ", ".join(said + [f"the payout address up to block {upto:,}"])
+    if need is not None and upto < need:
+        raise Stop(f"the wallet has read the payout address up to block {upto:,}, not yet block {need:,}",
+                   "wait until it has", wait=True)
+    # it logs a read only when new blocks arrive, so a quiet wallet is not a
+    # stopped one; a quiet wallet behind a node that has moved on is
+    if age > 600:
+        raise Stop(f"the wallet last read the payout address {int(age // 60)}m ago, up to "
+                   f"block {upto:,} of {height:,}: it has stopped",
+                   "restart the node once it is synced, then run it again")
+    raise Stop(f"the wallet has read the payout address up to block {upto:,} of {height:,}",
+               "wait until it catches up", wait=True)
+
+
+def funds(rpc: Rpc, payout: dict, height: int) -> dict:
+    """What there is to stake: the wallet's shielded notes it can spend now
+    (its own rule, 3 confirmations; notes a send of its own consumed are
+    `committed` and not offered) and the payout address's coins older than
+    SETTLE blocks. The wallet spends the notes first, then the coins."""
+    out = {"shielded": 0, "pending": 0, "committed": 0, "transparent": 0, "recent": 0, "outputs": 0}
+    f = wallet_funds(rpc)
+    if f:
+        out["shielded"] = int(f.get("spendable_zats") or 0)
+        out["pending"] = int(f.get("pending_zats") or 0)
+        out["committed"] = int(f.get("committed_zats") or 0)
+    elif payout["shielded"]:
+        raise Stop("the wallet has not finished its first pass (wallet_spendable_funds)",
+                   "wait a minute and run it again", wait=True)
+    if payout.get("t"):
+        utxos = rpc("getaddressutxos", [{"addresses": [payout["t"]]}]) or []
+        settled = sum(int(u["satoshis"]) for u in utxos
+                      if int(u.get("height", height)) <= height - SETTLE)
+        out["transparent"] = settled
+        out["recent"] = sum(int(u["satoshis"]) for u in utxos) - settled
+        out["outputs"] = len(utxos)
+    out["spendable"] = out["shielded"] + out["transparent"]
+    return out
+
+
+# ─── the stake ───────────────────────────────────────────────────────────────
+
+def plan(rpc: Rpc, cfg: dict, args, log=say, want: int | None = None,
+         need: int | None = None) -> dict:
+    """`want`: this batch's amount, fixed by the first plan; `need`: the block
+    with the batch before it."""
+    log("Checking")
+    payout = wallet_and_payout(rpc, cfg)
+    if payout["shielded"]:
+        log(f"  wallet on and started; rewards are paid to it shielded, at {short(payout['ua'])}")
+    else:
+        log(f"  wallet on and started; rewards are paid to {payout['t']}")
+    height = synced_and_on_chain(rpc, args.reference, log)
+    if args.reference:
+        log(f"  synced at block {height:,}, and the explorer's tip block is the same here")
+    no_stake_pending(rpc, payout, height, log)
+    seat = roster_seat(rpc, args.to)
+    if seat["rank"]:
+        log(f"  {short(args.to)} is on the roster: rank {seat['rank']} of {seat['of']}, {ctaz(seat['stake'])}")
+    else:
+        log(f"  {short(args.to)} is not on the roster"
+            + (f" of {seat['of']}" if seat["of"] else " (no roster yet)")
+            + ": a stake to it is valid; only the largest finalizers by stake vote")
+    day = staking_day(height)
+    log(f"  Staking Day open: block {day['pos']} of {day['period']}, closes in {day['closes_in']} blocks")
+    log(f"  {wallet_scanned(rpc, payout, height, need)}")
+    f = funds(rpc, payout, height)
+    parts = []
+    if f["shielded"] or payout["shielded"]:
+        parts.append(f"{ctaz(f['shielded'])} in shielded notes"
+                     + (f", and {ctaz(f['pending'])} too young" if f["pending"] else "")
+                     + (f", {ctaz(f['committed'])} spent by a send not in a block yet" if f["committed"] else ""))
+    if f["transparent"] or f["recent"] or not payout["shielded"]:
+        parts.append(f"{ctaz(f['transparent'])} in rewards older than {SETTLE} blocks"
+                     + (f", and {ctaz(f['recent'])} younger" if f["recent"] else ""))
+    log(f"  spendable {ctaz(f['spendable'])}: " + "; ".join(parts))
+    keep = round(args.keep * ZATS)
+    # a power of 10 is valid on every build, and the only amount v15's wallet takes
+    floor = max(power_of_10_floor(round(args.min * ZATS)), ZATS)
+    if power_of_10_floor(round(args.batch * ZATS)) < floor:
+        raise Stop(f"--batch {args.batch:g} cTAZ is under {ctaz(floor)}, the smallest piece "
+                   f"(--min {args.min:g} rounded down to a power of 10)",
+                   "a larger --batch, or a smaller --min")
+    if want is not None:
+        amount = want
+    elif args.all:
+        amount = (f["spendable"] - keep) // ZATS * ZATS       # whole cTAZ
+    else:
+        amount = round(args.amount * ZATS)
+        if not is_power_of_10(amount):
+            raise Stop(f"a stake is a power of 10: 1, 10, 100, "
+                       f"1,000 … cTAZ, or 0.1 or 0.01; {ctaz(amount)} is not",
+                       "pass one of those, or --all for pieces of them")
+    if want is not None and amount > f["spendable"] - keep:
+        # each stake's change is a shielded note, spendable three blocks
+        # later; so a later batch can look short when it is not. Stake what
+        # shows, not more.
+        amount = power_of_10_floor(max(f["spendable"] - keep, 0) // ZATS * ZATS)
+        if amount < floor:
+            return {"nothing": "the rewards left are spent; any change from the stakes "
+                               f"is a note too young to spend yet, or what is left is under "
+                               f"{ctaz(floor)}, the smallest piece"}
+        log(f"  this stake is {ctaz(amount)}: that is what is left to stake")
+    if want is None and args.all and amount < round(args.min * ZATS):
+        return {"nothing": f"{ctaz(f['spendable'])} spendable, {ctaz(keep)} kept: "
+                           f"under the {args.min:g} cTAZ minimum"}
+    if amount < ZATS:
+        raise Stop("a stake is at least 1 cTAZ")
+    if amount > f["spendable"] - keep:
+        raise Stop(f"{ctaz(amount)} is more than the {ctaz(max(f['spendable'] - keep, 0))} "
+                   f"there is to stake ({ctaz(keep)} kept for the fee)",
+                   "a smaller --amount, or --all")
+    return {"payout": payout, "height": height, "seat": seat, "day": day,
+            "amount": amount, "keep": keep, "funds": f,
+            "floor": floor}
+
+
+def batches(total: int, size: int, floor: int = ZATS) -> list[int]:
+    """Pieces of 1, 10, 100, 1,000 … cTAZ, largest first, none over `size` and
+    none under `floor`; 2,485 in 1,000s down to 10 is
+    1,000 · 1,000 · 100 · 100 · 100 · 100 · 10 × 8, and 5 is left."""
+    split, left = [], total
+    while (piece := power_of_10_floor(min(size, left))) >= floor:
+        split.append(piece)
+        left -= piece
+    return split
+
+
+def send(rpc: Rpc, target: str, amount: int, height: int, batch: str = "") -> int:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    entry = {"utc": stamp, "height": height, "amount_zats": amount,
+             "to_roster_key": finalizer_key(target), "target_finalizer": target,
+             "network": network()}
+    if batch:
+        entry["batch"] = batch
+    params = [{"CreateNewDelegationBond": {"amount_zats": amount, "target_finalizer": target}}]
+    say(f"Sending. The node answers once the stake is built and sent (up to {RPC_TIMEOUT // 60} minutes).")
+    started = time.time()
+    try:
+        body = rpc.raw("wallet_staking_action", params, timeout=RPC_TIMEOUT)
+        if method_missing(body):
+            # v14 has no wallet_staking_action: its stake call is
+            # staking_command, the same request as one JSON string, answered
+            # with that string once the stake is sent. A call the node does
+            # not have sent nothing, so asking again is safe.
+            entry["method"] = "staking_command"
+            body = rpc.raw("staking_command", [json.dumps(params[0])], timeout=RPC_TIMEOUT)
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+        ledger_add({**entry, "outcome": "timeout", "error": str(err)})
+        say(f"No reply: {err}")
+        say("It may still land. Do not send it again. Check in a few blocks:")
+        say("  rpc wallet_staking_positions          (CALLS.md)")
+        since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started - 5))
+        say(f"  {JOURNALCTL} -u {NODE_UNIT} --since '{since}' | grep 'rpc stake'")
+        return 3
+    path = save_reply(body, stamp)
+    entry["reply_file"] = path
+    try:
+        reply = json.loads(body)
+    except ValueError:
+        reply = {"error": {"message": body[:300].decode(errors="replace")}}
+    if reply.get("error"):
+        message = reply["error"].get("message", str(reply["error"]))
+        reasons = wallet_reason(started, amount) if "from notes" in message else []
+        ledger_add({**entry, "outcome": "refused", "error": message, "wallet_said": reasons})
+        say(f"The node did not stake: {message}")
+        for line in reasons:
+            say(f"  the wallet: {line}")
+        said = " ".join(reasons)
+        if "power of 10" in said:
+            say("The wallet takes only a power of 10 cTAZ, and this script stakes no other "
+                "amount. If this shows, the build's rule has changed: look at its wallet "
+                "(stake_ironwood_to_finalizer) before running it again.")
+        elif "invalid finalizer address" in said:
+            say("The node does not accept this finalizer address. Copy it again from the "
+                "finalizer, and check the node runs the network's current build.")
+        elif "consensus branch" in said:
+            say("The wallet builds for another network upgrade than the node's chain is on. "
+                "Wait a few blocks; if it stays, restart the node.")
+        elif "can't afford" in said:
+            say("The wallet has not seen enough coins yet. Wait a few blocks and run it again.")
+        elif "from notes" in message:
+            say("The wallet refused to build it"
+                + (": its words are above." if reasons else ", and the node's log gives no reason "
+                   "this script knows. Look at the lines from the moment of the call:"))
+            if not reasons:
+                since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started - 5))
+                say(f"  {JOURNALCTL} -u {NODE_UNIT} --since '{since}' -o cat | "
+                    "grep -vE 'NET:|PROTOCOL:|tip height' | head -40")
+        elif "in progress" in message:
+            say("The wallet is building another stake. Run it again in a minute.")
+        elif "failed to build" in message:
+            # the wallet says this for a stake it built and the node's mempool
+            # refused as well; the mempool's reason is logged at debug level only
+            say("The wallet built it, or tried to, and it went no further; the node does not "
+                "say why. A smaller --batch uses fewer coins per stake.")
+            say(f"  {JOURNALCTL} -u {NODE_UNIT} --since '-10min' | grep -E 'rpc stake' | cut -c1-200")
+        return 1
+    result = str(reply.get("result", ""))
+    txid = re.search(r'"txid"\s*:\s*"?([0-9a-f]{64})', result)
+    bond = re.search(r'unique_public_key"?\s*:\s*"([0-9a-f]{64})"', result)
+    entry.update({"outcome": "sent", "txid": txid.group(1) if txid else None,
+                  "bond_key": bond.group(1) if bond else None})
+    if entry.get("method") == "staking_command" and not entry["txid"]:
+        entry["txid"] = built_txid()
+    ledger_add(entry)
+    if entry.get("method") == "staking_command":
+        say("Sent. This build's stake call answers with no bond key: the wallet derives it from "
+            "the seed,")
+        say("and wallet_staking_positions lists the stake once its block is read.")
+        say(f"  txid     {entry['txid'] or '(not in the node’s log)'}")
+        return 0
+    say(f"Sent. The reply is in {path}")
+    say(f"  txid     {entry['txid'] or '(not in the reply)'}")
+    say("The wallet derives the bond key from the seed; wallet_staking_positions lists the stake "
+        "once its block is read.")
+    return 0
+
+
+def method_missing(body: bytes) -> bool:
+    try:
+        error = json.loads(body).get("error") or {}
+    except (ValueError, AttributeError):
+        return False
+    return error.get("code") == -32601 or "method not found" in str(error.get("message", "")).lower()
+
+
+def watch(rpc: Rpc, entry: dict, minutes: float) -> int | None:
+    """Wait for the stake to be in a block, and return that block. Ctrl-C is
+    safe: the wallet derives the key from the seed."""
+    say(f"Waiting up to {minutes:g} minutes for a block with it (Ctrl-C is safe).")
+    end = time.time() + minutes * 60
+    while time.time() < end:
+        time.sleep(20)
+        position = find_position(rpc, entry)
+        if position:
+            block = landed(entry, position)
+            say(f"In block {block:,}: {ctaz(int(position.get('initial_val', 0)))} staked. "
+                "The finalizer's roster stake rises by it at the next finalized block.")
+            return block
+    say("Not in a block yet. Check later: rpc wallet_staking_positions (CALLS.md).")
+    return None
+
+
+# ─── the timer ───────────────────────────────────────────────────────────────
+
+TIMER = "crosslink-stake"
+
+
+def timer_units(args) -> tuple[str, str]:
+    """The service and the timer, as text. The service runs this file as it was
+    run now: same interpreter path, same CROSSLINK_* variables."""
+    cmd = ["/usr/bin/env", "python3", os.path.abspath(__file__), "--auto", "--to", args.to,
+           "--min", f"{args.min:g}", "--keep", f"{args.keep:g}", "--batch", f"{args.batch:g}"]
+    if args.reference:
+        cmd += ["--reference", args.reference]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    env = "".join(f"Environment={json.dumps(f'{k}={v}')}\n"
+                  for k, v in sorted(os.environ.items()) if k.startswith("CROSSLINK_"))
+    service = (
+        "# written by crosslink-stake --timer install; remove with --timer remove\n"
+        "[Unit]\n"
+        "Description=Stake this host's mining rewards (crosslink-stake --auto)\n"
+        f"After={NODE_UNIT}.service\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"{env}"
+        f"ExecStart={shlex.join(cmd).replace('%', '%%')}\n")
+    timer_ = (
+        "# written by crosslink-stake --timer install; remove with --timer remove\n"
+        "[Unit]\n"
+        "Description=Run crosslink-stake --auto\n\n"
+        "[Timer]\n"
+        "OnBootSec=10min\n"
+        f"OnUnitInactiveSec={args.every}min\n"
+        "RandomizedDelaySec=2min\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n")
+    return service, timer_
+
+
+def timer(args) -> int:
+    user = os.geteuid() != 0
+    ctl = ["systemctl", "--user"] if user else ["systemctl"]
+    where = (os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                          "systemd", "user") if user else "/etc/systemd/system")
+    paths = [os.path.join(where, f"{TIMER}.{kind}") for kind in ("service", "timer")]
+    journal = f"journalctl{' --user' if user else ''} -u {TIMER}.service"
+    if args.timer == "show":
+        for path, text in zip(paths, timer_units(args)):
+            say(f"# {path}")
+            say(text)
+        return 0
+    if args.timer == "install":
+        if args.every < 1:
+            print("crosslink-stake: --every is at least 1 minute", file=sys.stderr)
+            return 1
+        os.makedirs(where, exist_ok=True)
+        units = timer_units(args)
+        try:
+            same = [open(p, encoding="utf-8").read() for p in paths] == list(units)
+        except OSError:
+            same = False
+        if same and not subprocess.run(ctl + ["is-active", "--quiet", f"{TIMER}.timer"],
+                                       check=False).returncode:
+            say(f"Unchanged: {' and '.join(paths)}")
+            return 0
+        for path, text in zip(paths, units):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        # `enable --now` leaves a timer that is already active as it was, with
+        # its old interval, and systemd counts OnUnitInactiveSec from the last
+        # pass, so a rewritten timer is restarted (a pass in flight is a
+        # separate unit and runs on) and a pass is started now, so a new
+        # address, minimum or script stakes in this Staking Day, not the next
+        # tick's.
+        subprocess.run(ctl + ["daemon-reload"], check=False)
+        subprocess.run(ctl + ["enable", f"{TIMER}.timer"], check=False)
+        if subprocess.run(ctl + ["restart", f"{TIMER}.timer"], check=False).returncode:
+            say("The timer is written and did not start; see the line above.")
+            return 1
+        subprocess.run(ctl + ["start", "--no-block", f"{TIMER}.service"], check=False)
+        say(f"Installed: {' and '.join(paths)}")
+        say(f"Every {args.every} minutes it stakes all but {args.keep:g} cTAZ, once "
+            f"{args.min:g} cTAZ has gathered, to")
+        say(f"  {args.to}")
+        if args.dry_run:
+            say("Dry run: it checks and sends nothing. Install again without --dry-run to stake.")
+        say("A pass is running now; the next is in "
+            f"{args.every} minutes after it ends.")
+        say(f"A run now:  {' '.join(ctl)} start {TIMER}.service")
+        say(f"Its output: {journal}")
+        say("Stop it:    crosslink-stake --timer remove")
+        return 0
+    if args.timer == "remove":
+        subprocess.run(ctl + ["disable", "--now", f"{TIMER}.timer"], check=False,
+                       capture_output=True)
+        gone = [p for p in paths if os.path.exists(p)]
+        for path in gone:
+            os.remove(path)
+        subprocess.run(ctl + ["daemon-reload"], check=False)
+        say(f"Removed: {' and '.join(gone)}" if gone else "No timer was installed.")
+        return 0
+    # status
+    if not os.path.exists(paths[1]):
+        say("No timer is installed. crosslink-stake --to ADDRESS --timer install")
+        return 0
+    m = re.search(r"^ExecStart=(.*)$", open(paths[0], encoding="utf-8").read(), re.M)
+    say(f"Runs    {m.group(1) if m else '(no ExecStart in ' + paths[0] + ')'}")
+    say(sh(*ctl, "list-timers", f"{TIMER}.timer", "--no-pager").strip())
+    say("Last run")
+    say(sh(*journal.split(), "-n", "12", "--no-pager", "-o", "cat").rstrip() or "  (none yet)")
+    last = ledger_last()
+    if last:
+        say(f"Last stake  {last.get('utc')} · block {int(last.get('height', 0)):,} · "
+            f"{ctaz(int(last.get('amount_zats', 0)))} · {last.get('outcome')}")
+    else:
+        say("Last stake  none yet")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Stake this host's mining rewards to a finalizer (Feature Net).",
+        epilog="Checks, then asks, then sends. See the top of this file for every check.")
+    ap.add_argument("--to", metavar="ADDRESS",
+                    help="the finalizer address (zfinv1…): the one the finalizer's node logs "
+                         "at start")
+    how = ap.add_mutually_exclusive_group()
+    how.add_argument("--amount", type=float, metavar="CTAZ", help="stake this many cTAZ")
+    how.add_argument("--all", action="store_true", help="stake everything spendable but --keep")
+    how.add_argument("--auto", action="store_true",
+                     help="for a timer: --all --yes, and a check that passes by itself "
+                          "later ends the run with exit 0")
+    ap.add_argument("--timer", choices=("install", "remove", "status", "show"),
+                    help="install, remove or show the systemd timer that runs --auto")
+    ap.add_argument("--every", type=int, default=30, metavar="MIN",
+                    help="with --timer install: minutes between runs (default 30)")
+    ap.add_argument("--batch", type=float, default=1000, metavar="CTAZ",
+                    help="the most one stake carries; more is sent as several (default 1000)")
+    ap.add_argument("--keep", type=float, default=1, metavar="CTAZ",
+                    help="leave this much for the fee (default 1; the fee is 5,000 zats "
+                         "a coin spent, 0.01 cTAZ for a stake of 1,000)")
+    ap.add_argument("--min", type=float, metavar="CTAZ",
+                    help="with --all: below this, stake nothing and exit 0 (default 1; "
+                         "10 in a timer); under the power-of-10 rule also the smallest "
+                         "piece, rounded down to a power of 10")
+    ap.add_argument("--wait", action="store_true",
+                    help="wait for Staking Day, the wallet and the node, up to 6 hours")
+    ap.add_argument("--yes", action="store_true", help="send without asking")
+    ap.add_argument("--dry-run", action="store_true", help="check everything, send nothing")
+    ap.add_argument("--watch", type=float, default=10, metavar="MIN",
+                    help="minutes to wait for the stake to be in a block (default 10, 0 = none)")
+    ap.add_argument("--reference", metavar="URL",
+                    help="also compare the block at this explorer's tip (JSON with tip and "
+                         "tip_hash); off by default")
+    args = ap.parse_args()
+    if args.timer in ("remove", "status"):
+        return timer(args)
+    if not args.to:
+        ap.error("--to is required")
+    if not (args.timer or args.amount is not None or args.all or args.auto):
+        ap.error("one of --amount, --all, --auto is required")
+    if args.min is None:
+        args.min = 10 if args.timer else 1
+    if args.auto:
+        args.all = args.yes = True
+    args.to = args.to.strip()
+    if args.reference == "none":
+        args.reference = None
+    if args.batch < 1:
+        print("crosslink-stake: --batch is at least 1 cTAZ", file=sys.stderr)
+        return 1
+    if not finalizer_key(args.to):
+        print("crosslink-stake: --to is not a finalizer address (zfinv1 + 128 base64url "
+              "characters, 134 in all)", file=sys.stderr)
+        return 1
+    if args.timer:
+        return timer(args)
+    try:
+        cfg = tomllib.load(open(CONFIG, "rb"))
+    except (OSError, tomllib.TOMLDecodeError) as err:
+        print(f"crosslink-stake: cannot read {CONFIG}: {err} (run it with sudo)", file=sys.stderr)
+        return 1
+    rpc = Rpc(f"http://{cfg.get('rpc', {}).get('listen_addr', '127.0.0.1:8232')}/")
+
+    if not args.dry_run:
+        # one sender at a time: a timer's run and one by hand would offer the same coins
+        lock = open(os.path.join(stake_dir(), "lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            say("Another crosslink-stake is running; nothing done.")
+            return 0 if args.auto else 1
+    p = settle(rpc, cfg, args, time.time() + 6 * 3600, say)
+    if p is None:
+        return 1
+    if "later" in p:
+        return 0
+    if "nothing" in p:
+        say(f"Nothing to stake: {p['nothing']}.")
+        return 0
+
+    target = args.to
+    split = batches(p["amount"], round(args.batch * ZATS), p["floor"])
+    if not split:
+        say(f"Nothing to stake: {ctaz(p['amount'])} is under {ctaz(p['floor'])}, "
+            "the smallest piece (a stake is a power of 10 cTAZ).")
+        return 0
+    staked = sum(split)
+    say()
+    say(f"Stake   {ctaz(staked)}"
+        + (f", as {len(split)} stakes of up to {ctaz(max(split))}, one after another"
+           if len(split) > 1 else ""))
+    say("        a power of 10 cTAZ each (the only amount v15's wallet takes)"
+        + (f"; {ctaz(p['amount'] - staked)} stays for a later pass" if staked < p["amount"] else ""))
+    say(f"to      {args.to}")
+    seat_line = (f"rank {p['seat']['rank']} of {p['seat']['of']}, {ctaz(p['seat']['stake'])}"
+                 if p["seat"]["rank"] else "not on the roster")
+    say(f"        key {finalizer_key(args.to)}, {seat_line}")
+    fu, po = p["funds"], p["payout"]
+    if po["shielded"]:
+        say(f"from    this wallet's shielded notes ({ctaz(fu['shielded'])})"
+            + (f" and {po['t']} ({ctaz(fu['transparent'])})" if fu["transparent"] else "")
+            + f", about {ctaz(fu['spendable'] - staked)} left after it")
+    else:
+        say(f"from    {po['t']}"
+            + (f" and {ctaz(fu['shielded'])} in this wallet's shielded notes" if fu["shielded"] else "")
+            + f", about {ctaz(fu['spendable'] - staked)} left after it")
+    say(f"at      block {p['height']:,}, Staking Day closes in {p['day']['closes_in']} blocks")
+    if len(split) > 1:
+        say("        each stake waits for the one before it to be in a block; "
+            "one that cannot go stops the rest")
+    if args.dry_run:
+        say("Dry run: nothing sent.")
+        return 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            say("Stopped: no terminal to ask on. Pass --yes to send without asking.")
+            return 1
+        if input("Type yes to send it: ").strip().lower() != "yes":
+            say("Nothing sent.")
+            return 1
+
+    done, in_block = 0, None
+    for i, amount in enumerate(split, 1):
+        tag = f"{i}/{len(split)}" if len(split) > 1 else ""
+        if i > 1:
+            say()
+            say(f"Stake {tag}: {ctaz(amount)}")
+            # the one before is in block `landed`; the wallet must have read it
+            q = settle(rpc, cfg, args, time.time() + 6 * 3600, say, want=amount, need=in_block,
+                       between=True)
+            if q is None:
+                return report(done, split, 1)
+            if "later" in q:
+                return report(done, split, 0)
+            if "nothing" in q:
+                say(f"Nothing more to stake: {q['nothing']}.")
+                break
+            p, amount = q, q["amount"]
+        code = send(rpc, target, amount, p["height"], tag)
+        if code != 0:
+            return report(done, split, code)
+        done += amount
+        last = ledger_last()
+        last_batch = i == len(split)
+        minutes = args.watch if last_batch else max(args.watch, 10)
+        if not (minutes > 0 and last and last.get("outcome") == "sent"):
+            if last_batch:
+                break
+            say("The ledger has no line for this stake, so this script cannot tell when it "
+                "is in a block.")
+            return report(done, split, 1)
+        in_block = watch(rpc, last, minutes)
+        if in_block is None and not last_batch:
+            return report(done, split, 1)
+    if len(split) > 1:
+        say()
+        say(f"{i} stakes sent, {ctaz(done)} in all. The replies and the ledger are in "
+            f"{STAKE_DIR}: copy it to the key bundle.")
+    return 0
+
+
+def settle(rpc: Rpc, cfg: dict, args, deadline: float, log, want: int | None = None,
+           need: int | None = None, between: bool = False) -> dict | None:
+    """Run the checks until they pass. With --wait, wait out any check that can
+    pass by itself; between batches, wait out all of those but Staking Day,
+    which only --wait waits for."""
+    waiting = None
+    while True:
+        try:
+            return plan(rpc, cfg, args, log, want, need)
+        except Stop as stop:
+            patient = args.wait or (between and not stop.day)
+            if patient and stop.wait and time.time() < deadline:
+                if stop.what != waiting:
+                    say(f"  waiting: {stop.what}")
+                log, waiting = (lambda *_: None), stop.what
+                time.sleep(20 if between else 60)
+                continue
+            if args.auto and stop.wait:
+                say(f"Not now: {stop.what}.")
+                return {"later": stop.what}
+            say(f"Stopped: {stop.what}.")
+            if stop.next:
+                say(f"Next: {stop.next}.")
+            return None
+
+
+def report(done: int, split: list[int], code: int) -> int:
+    if len(split) > 1 and done:
+        say(f"{ctaz(done)} of {ctaz(sum(split))} staked; the rest is not sent. "
+            "Run it again to stake what is left.")
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)

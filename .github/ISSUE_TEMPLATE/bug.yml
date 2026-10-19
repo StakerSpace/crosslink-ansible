@@ -1,0 +1,38 @@
+name: Something went wrong
+description: A playbook failed, a host is not doing what the inventory says, or a script is wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. The more of the run you paste, the less guessing. **Strip anything private first**: host names, addresses, seed fingerprints, phrases, the contents of the key bundle.
+  - type: input
+    id: command
+    attributes:
+      label: The command
+      placeholder: ansible-playbook -i inventory.yml site.yml -l miner-1
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: What it printed
+      description: The failing task and the lines around it, or the output of `sudo crosslink-check`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+  - type: textarea
+    id: inventory
+    attributes:
+      label: The host's inventory entry
+      description: With `ansible_host` and `crosslink_public_ip` replaced by example addresses (203.0.113.x).
+      render: yaml
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: ansible-core 2.17, this repository at commit …, crosslink_ref v15, host Ubuntu 24.04

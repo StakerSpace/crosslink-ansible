@@ -1,0 +1,165 @@
+---
+# What this miner has earned. Asks the node on the host about the payout
+# address (files/rewards.py); nothing is derived. Runs from the rewards.yml
+# playbook only, never from site.yml: it reads the address itself from the
+# bundle's identity.json, or the journal. Writes rewards.json to the key bundle.
+
+- name: Set bundle path
+  ansible.builtin.set_fact:
+    node_bundle: "{{ node_bundle | default(crosslink_keys_dir ~ '/' ~ inventory_hostname) }}"
+
+# The deploy recorded the payout address in the bundle's identity.json. Read
+# it there first: instant, and no journal.
+- name: Read the bundle's record
+  ansible.builtin.slurp:
+    src: "{{ node_bundle }}/identity.json"
+  register: rewards_record
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  when: node_miner_address is not defined
+
+- name: Set payout address from the record
+  ansible.builtin.set_fact:
+    rewards_recorded_address: "{{ (((rewards_record.content | b64decode) | from_json).mining | default({})).payout_address | default('') }}"
+  when:
+    - node_miner_address is not defined
+    - rewards_record.content is defined
+
+# Without a record, ask the journal. The node logs "Mining to t…" once, at
+# start, so the newest such line sits behind the current run's output only.
+# journalctl searches backwards from the end and -n 1 stops it at the first
+# hit, so it never reads the whole journal, which on a miner a few days old
+# is gigabytes. A pipe into head does not stop it: journalctl block-buffers
+# into a pipe and read on through every earlier run's "Mining to" line.
+- name: Read payout address from the node log
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      journalctl -u {{ crosslink_service_name | quote }} -r -n 1 -o cat --no-pager --grep 'Mining to t[1-9A-HJ-NP-Za-km-z]{20,}' 2>/dev/null \
+        | grep -aoE 't[1-9A-HJ-NP-Za-km-z]{20,}' | head -n 1 | tr -d '\n'
+  register: rewards_logged_address
+  changed_when: false
+  failed_when: false
+  timeout: 300
+  when:
+    - node_miner_address is not defined
+    - not (rewards_recorded_address | default(''))
+
+- name: Set payout address
+  ansible.builtin.set_fact:
+    node_miner_address: >-
+      {{ crosslink_miner_address if crosslink_miner_address
+         else (rewards_recorded_address | default('') or (rewards_logged_address.stdout | default('') | trim)) }}
+  when: node_miner_address is not defined
+
+- name: Check the payout address is known
+  ansible.builtin.assert:
+    that: node_miner_address | length > 0
+    fail_msg: >-
+      No payout address for {{ inventory_hostname }}: none in
+      {{ node_bundle }}/identity.json and none in the node's journal (the node
+      logs "Mining to t…" at start). Pass it: -e node_miner_address=t…
+    quiet: true
+
+# zebrad writes the seed first thing in start() and opens the RPC port only
+# once the state is loaded, so a node the Nodes play has just restarted passes
+# the seed wait and still refuses this connection. Retries print a countdown.
+- name: Wait for the node's RPC (up to 5 min)
+  ansible.builtin.uri:
+    url: "http://{{ crosslink_rpc_listen }}/"
+    method: POST
+    body_format: json
+    body: {"jsonrpc": "1.0", "id": "wait", "method": "getblockcount", "params": []}
+  register: rewards_rpc_wait
+  until: rewards_rpc_wait.status == 200
+  retries: 60
+  delay: 5
+  ignore_errors: true
+
+- name: Check the node answers on its RPC
+  ansible.builtin.fail:
+    msg: >-
+      The node on {{ inventory_hostname }} does not answer at
+      http://{{ crosslink_rpc_listen }}/ ({{ rewards_rpc_wait.msg | default('no reply') }}).
+      It is active but has not opened its RPC port yet, or is restarting.
+      Check: journalctl -u {{ crosslink_service_name }} -n 50. Then re-run:
+      ansible-playbook -i inventory.yml site.yml -l {{ inventory_hostname }} --tags identity
+  when: rewards_rpc_wait.status | default(-1) != 200
+
+# A transparent payout address is read off the chain (rewards.py). A unified
+# one (rewards shielded) is not on the chain to read: the wallet on the host
+# says what it holds now, spendable and pending, and nothing says what it
+# received in total.
+- name: Read the rewards
+  ansible.builtin.script:
+    cmd: >-
+      rewards.py --json
+      --rpc http://{{ crosslink_rpc_listen }}/
+      --maturity {{ crosslink_coinbase_maturity | int }}
+      {{ node_miner_address | quote }}
+    executable: python3
+  register: rewards_read
+  changed_when: false
+  when: node_miner_address is match('^t')
+
+- name: Read the wallet's shielded funds
+  ansible.builtin.uri:
+    url: "http://{{ crosslink_rpc_listen }}/"
+    method: POST
+    body_format: json
+    body: {"jsonrpc": "2.0", "id": "rewards", "method": "wallet_spendable_funds", "params": []}
+    return_content: true
+    status_code: [200, 500]
+  register: rewards_wallet
+  failed_when: >-
+    (rewards_wallet.json | default({})).result | default({}) | length == 0
+  when: not node_miner_address is match('^t')
+
+- name: Parse the rewards
+  ansible.builtin.set_fact:
+    node_rewards: >-
+      {{ (rewards_read.stdout | from_json) if node_miner_address is match('^t')
+         else {
+           'read_at': ansible_date_time.iso8601,
+           'shielded': true,
+           'address': node_miner_address,
+           'wallet': rewards_wallet.json.result,
+           'text': {
+             'spendable': ('%.3f' | format((rewards_wallet.json.result.spendable_zats | int) / 100000000)),
+             'pending': ('%.3f' | format((rewards_wallet.json.result.pending_zats | int) / 100000000)),
+             'tip': rewards_wallet.json.result.tip_height | default(0),
+           },
+           'summary': ('shielded: spendable ' ~ ('%.3f' | format((rewards_wallet.json.result.spendable_zats | int) / 100000000))
+                       ~ ' cTAZ, pending ' ~ ('%.3f' | format((rewards_wallet.json.result.pending_zats | int) / 100000000))
+                       ~ ' cTAZ; what was received in total is not on the chain to read'),
+         } }}
+
+# ansible_become as a task var, not just the keyword: an inventory-level
+# ansible_become outranks the keyword and would sudo on the control machine.
+- name: Create key bundle directory
+  ansible.builtin.file:
+    path: "{{ node_bundle }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+
+- name: Write rewards.json
+  ansible.builtin.copy:
+    content: "{{ node_rewards | to_nice_json }}\n"
+    dest: "{{ node_bundle }}/rewards.json"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+
+- name: Show the rewards
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} ({{ node_miner_address }}): {{ node_rewards.summary }}. Written to {{ node_bundle }}/rewards.json."

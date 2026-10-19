@@ -1,0 +1,69 @@
+{
+  "host": {{ inventory_hostname | to_json }},
+  "address": {{ (ansible_host | default(inventory_hostname)) | to_json }},
+  "gathered_utc": {{ ansible_date_time.iso8601 | to_json }},
+  "roles": {{ ((['miner'] if crosslink_mining_enabled | bool else []) + (['finalizer'] if crosslink_finalizer_enabled | bool else [])) | to_json }},
+  "chain": {{ crosslink_network | to_json }},
+
+  "source": {
+    "repo": {{ crosslink_repo | to_json }},
+    "ref": {{ crosslink_ref | to_json }},
+    "commit": {{ (crosslink_commit | default('')) | to_json }},
+    "install_mode": {{ zebrad_install_mode | to_json }},
+    "version": {{ (node_facts.version | default('')) | to_json }}
+  },
+
+  "service": {
+    "unit": {{ (crosslink_service_name ~ '.service') | to_json }},
+    "binary": {{ (crosslink_home ~ '/bin/' ~ (crosslink_binary | default('zebrad'))) | to_json }},
+    "config": {{ (crosslink_config_dir ~ '/zebrad.toml') | to_json }},
+    "data_dir": {{ crosslink_data_dir | to_json }},
+    "user": {{ crosslink_user | to_json }}
+  },
+
+  "network": {
+    "public_address": {{ crosslink_public_address | to_json }},
+    "advertised_by_node": {{ (node_facts.advertised | default('')) | to_json }},
+    "p2p_listen": {{ crosslink_p2p_listen | to_json }},
+    "bft_local_port": {{ crosslink_bft_local_port }},
+    "bft_overlay_port": {{ crosslink_bft_overlay_port }},
+    "rpc_listen": {{ crosslink_rpc_listen | to_json }},
+    "identity_seed_string": {{ crosslink_identity_seed | to_json }}
+  },
+
+  "bft": {
+    "fingerprint": {{ node_bft_fingerprint | to_json }},
+    "roster_seat": {{ node_bft_seat | to_json }},
+    "finalizer": {{ (crosslink_finalizer_enabled | bool) | to_json }},
+    "finalizer_address": {{ (node_finalizer_address | default('')) | to_json }}
+  },
+
+  "mining": {
+    "enabled": {{ (crosslink_mining_enabled | bool) | to_json }},
+    "payout_address": {{ node_miner_address | to_json }},
+    "payout_address_source": {{ node_miner_address_source | to_json }},
+    "payout_from_seed": {{ ((crosslink_mining_enabled | bool) and not crosslink_miner_address) | to_json }},
+    "payout_shielded": {{ (node_miner_shielded | default(false) | bool) | to_json }},
+    "wallet_address": {{ (node_wallet_address | default('')) | to_json }},
+    "extra_coinbase_data": {{ crosslink_miner_extra_coinbase_data | to_json }}
+  },
+
+  "rewards": {{ (node_rewards if node_rewards is defined else none) | to_json }},
+
+{% if node_seed_copied | bool %}
+  "seed": {
+    "path_on_host": {{ node_seed_path | to_json }},
+    "bytes": 32,
+    "sha256_prefix": {{ node_seed_fingerprint | to_json }},
+    "format": "BIP-39 entropy (24 words in mnemonic.txt)",
+    "files": ["secret.seed", "seed.hex", "mnemonic.txt"],
+    "is": {{ (((['the wallet the mining rewards go to'] if (crosslink_mining_enabled | bool) and not crosslink_miner_address else []) + (['the finalizer identity stake points at'] if crosslink_finalizer_enabled | bool else []))) | to_json }}
+  }
+{% else %}
+  "seed": {
+    "path_on_host": {{ node_seed_path | to_json }},
+    "copied": false,
+    "why": "RPC node: no seat, no rewards; a fresh seed changes nothing"
+  }
+{% endif %}
+}

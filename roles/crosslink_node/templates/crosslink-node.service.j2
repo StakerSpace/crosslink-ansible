@@ -1,0 +1,32 @@
+# Managed by Ansible (crosslink-ansible). Do not edit by hand.
+[Unit]
+Description=Crosslink full node{{ ' (mining)' if crosslink_mining_enabled | bool else '' }}{{ ' (finalizer)' if crosslink_finalizer_enabled | bool else '' }}
+Documentation=https://github.com/ShieldedLabs/crosslink_monolith
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor={{ crosslink_data_dir }}
+
+[Service]
+Type=simple
+User={{ crosslink_user }}
+Group={{ crosslink_user }}
+ExecStart={{ crosslink_home }}/bin/zebrad -c {{ crosslink_config_dir }}/zebrad.toml start{{ ' --headless' if '--headless' in (node_start_help.stdout | default('')) else '' }}
+Restart=on-failure
+RestartSec=15
+LimitNOFILE=65536
+
+# Least privilege.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths={{ crosslink_data_dir }}
+
+[Install]
+WantedBy=multi-user.target

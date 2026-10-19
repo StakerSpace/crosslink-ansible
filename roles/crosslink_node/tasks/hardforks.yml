@@ -1,0 +1,101 @@
+---
+# Hard fork rules: checked before zebrad.toml is written.
+# zebrad refuses a malformed rule at start and the node stays down. Check the
+# same things here, before anything is written: a positive PoW height on a
+# staking period boundary, a non-empty list of 32-byte keys, no key twice,
+# one schedule.
+- name: Check the hard fork rule list
+  ansible.builtin.assert:
+    that:
+      - crosslink_hardforks is sequence
+      - crosslink_hardforks is not string
+      - crosslink_hardforks | map(attribute='pow_activation_height') | unique | length == crosslink_hardforks | length
+      - (crosslink_hardforks | sort(attribute='pow_activation_height') | map(attribute='bft_certificate_height') | list)
+        == (crosslink_hardforks | map(attribute='bft_certificate_height') | sort | list)
+    fail_msg: >-
+      crosslink_hardforks must be a list of rules with different PoW heights,
+      whose BFT heights rise with them. A bare "crosslink_hardforks:" key in
+      the inventory overrides group_vars with nothing: remove it or write "[]".
+    quiet: true
+
+- name: Check each hard fork rule
+  ansible.builtin.assert:
+    that:
+      - (item.keys() | list | sort) == ['bft_certificate_height', 'pow_activation_height', 'terminated_finalizers']
+      - item.pow_activation_height | int > 0
+      - item.pow_activation_height | int % (crosslink_chain.staking_period_blocks | int) == 0
+      - item.bft_certificate_height | int > 0
+      - item.terminated_finalizers is sequence
+      - item.terminated_finalizers is not string
+      - item.terminated_finalizers | length > 0
+      - item.terminated_finalizers | select('match', '^[0-9a-fA-F]{64}$') | list | length == item.terminated_finalizers | length
+      - item.terminated_finalizers | map('lower') | unique | length == item.terminated_finalizers | length
+    fail_msg: >-
+      The hard fork rule at PoW {{ item.pow_activation_height | default('?') }} is not
+      one zebrad accepts. It needs exactly pow_activation_height (a multiple of
+      {{ crosslink_chain.staking_period_blocks }}), bft_certificate_height, and
+      terminated_finalizers: 64-character hex keys, none twice.
+    quiet: true
+  loop: "{{ crosslink_hardforks }}"
+  loop_control:
+    label: "PoW {{ item.pow_activation_height | default('?') }}"
+
+# A rule changes nothing the node has already written to disk. Adding one to a
+# node that is past the rule's PoW height leaves that node on its own branch
+# after the restart. So a rule this node does not run yet goes in only while
+# its tip is at least crosslink_hardfork_margin blocks below the rule's PoW
+# height. Past that, the fix is a state rebuilt from a snapshot taken before
+# it: restore.yml.
+- name: Read the hard fork rules the node runs with
+  ansible.builtin.shell: >-
+    grep -oE '^pow_activation_height *= *[0-9]+' {{ crosslink_config_dir | quote }}/zebrad.toml
+    2>/dev/null | grep -oE '[0-9]+$' || true
+  register: node_loaded_rules
+  changed_when: false
+  when: crosslink_hardforks | length > 0
+
+- name: List the rules this run adds
+  ansible.builtin.set_fact:
+    node_new_rules: >-
+      {{ crosslink_hardforks | map(attribute='pow_activation_height') | map('int')
+         | reject('in', node_loaded_rules.stdout_lines | default([]) | map('int') | list) | list }}
+  when: crosslink_hardforks | length > 0
+
+- name: Read the node's tip
+  ansible.builtin.uri:
+    url: "http://{{ crosslink_rpc_listen }}/"
+    method: POST
+    body_format: json
+    body: { jsonrpc: "2.0", id: 1, method: getblockchaininfo, params: [] }
+    timeout: 10
+  register: node_tip_rpc
+  failed_when: false
+  when: node_new_rules | default([]) | length > 0
+
+- name: Refuse a rule the node is too close to
+  ansible.builtin.assert:
+    that: >-
+      (node_tip_rpc.json.result.blocks | int) <
+      (node_new_rules | min) - (crosslink_hardfork_margin | int)
+    fail_msg: >-
+      The node is at block {{ node_tip_rpc.json.result.blocks }}. The new rule
+      at PoW {{ node_new_rules | min }} must be loaded before block
+      {{ (node_new_rules | min) - (crosslink_hardfork_margin | int) }}. Nothing
+      was written. If the node is already past the rule's PoW height, it is on
+      its own branch: rebuild its state from a snapshot taken before that
+      height with restore.yml, then run site.yml again. README.md, "Hard fork
+      rules".
+    quiet: true
+  when:
+    - node_new_rules | default([]) | length > 0
+    - node_tip_rpc.json.result.blocks is defined
+
+- name: Say the node's tip could not be checked
+  ansible.builtin.debug:
+    msg: >-
+      The node did not answer, so its tip was not checked against the new
+      hard fork rule at PoW {{ node_new_rules | min }}. It reads the rule when
+      it starts. That is safe only if its state is below that height.
+  when:
+    - node_new_rules | default([]) | length > 0
+    - node_tip_rpc.json.result.blocks is not defined

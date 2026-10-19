@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""Is this host working? One screen, read from the host itself.
+
+    sudo crosslink-check              one screen
+    sudo crosslink-check --roster     the same, with every finalizer on the roster
+    sudo crosslink-check --json       everything as JSON, for a script
+    sudo crosslink-check --no-color   no colour (also: NO_COLOR=1, or not a terminal)
+
+Installed by crosslink-ansible on every node host. Standard library only.
+Nothing here changes anything: it asks the node's RPC on loopback, systemd
+and the journal. Every figure names its source; a figure it could not read
+is a dash, never a guess.
+
+What it answers, in order: are the services up · is the node synced, and how
+fast is it moving since the last run · does it have peers · is finality
+running, and how far behind the tip · is this node's finalizer on the roster,
+with how much stake · is the miner on, where do rewards go, what has landed
+there · has the headless wallet started and read the payout address to the
+tip, what it can spend, and has its tree diverged · what this wallet has
+staked, to which finalizer, and whether it could stake now.
+
+Reads `/etc/crosslink/zebrad.toml` for the RPC address and the switches, so
+run it as root or as the node's user. State between runs (for the block
+rate) is one line in /var/tmp.
+"""
+import base64
+import calendar
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+CONFIG = os.environ.get("CROSSLINK_CHECK_CONFIG", "/etc/crosslink/zebrad.toml")
+STATE = os.environ.get("CROSSLINK_CHECK_STATE", "/var/tmp/crosslink-check.state")
+WALLET_STATE = STATE + ".wallet"        # the wallet's read position at the last run
+HOST_README = os.environ.get("CROSSLINK_CHECK_HOST_README", "/etc/crosslink/README.md")
+NODE_UNIT = "crosslink-node"
+# A node this playbook did not build, run by hand: its log file(s) instead of
+# the journal (CROSSLINK_CHECK_LOG, paths joined by ":"; the tracing log has a
+# time on every line, stdout has none, so a line from stdout is dated by the
+# file), a user unit (CROSSLINK_CHECK_USER_UNIT=1), and the chain's calendar
+# from CROSSLINK_CHAIN_ENV. The playbook writes /etc/crosslink/chain.env on
+# every node host.
+LOG_FILES = [x for x in os.environ.get("CROSSLINK_CHECK_LOG", "").split(":") if x]
+USER_UNIT = bool(os.environ.get("CROSSLINK_CHECK_USER_UNIT"))
+SYSTEMCTL = ("systemctl", "--user") if USER_UNIT else ("systemctl",)
+JOURNALCTL = "journalctl --user" if USER_UNIT else "journalctl"
+CHAIN_ENV = os.environ.get("CROSSLINK_CHAIN_ENV", "/etc/crosslink/chain.env")
+ISO = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z")
+UNITS = (NODE_UNIT, "crosslink-stake.timer")
+ZATS = 100_000_000
+DASH = "—"
+# the rules crosslink-stake (operator/) stakes by, so "ready to stake" here
+# means it would go ahead: rewards younger than SETTLE blocks are not counted,
+# Staking Day needs MARGIN blocks left, and --keep, --min and --batch are the
+# timer's when it has one, else the script's defaults by hand
+SETTLE, MARGIN = 10, 15
+STAKE_UNIT = "crosslink-stake"
+
+
+# ─── plumbing ────────────────────────────────────────────────────────────────
+
+def sh(*cmd: str, timeout: int = 20) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _file_last(pattern: str, lines: int | None) -> tuple[float | None, str]:
+    """The newest line in LOG_FILES matching `pattern`, with its time. Read
+    from the end and stopped at the first hit; `lines` bounds the read."""
+    best: tuple[float | None, str] = (None, "")
+    for path in LOG_FILES:
+        q = json.dumps(path)
+        src = f"tail -n {lines} {q} | tac" if lines else f"tac {q}"
+        line = sh("bash", "-c", f"{src} 2>/dev/null | grep -m 1 -aE {json.dumps(pattern)}",
+                  timeout=120).strip()
+        if not line:
+            continue
+        m = ISO.match(line)
+        if m:
+            when = float(calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")))
+        else:
+            try:
+                when = os.path.getmtime(path)
+            except OSError:
+                when = None
+        if best[0] is None or (when is not None and when > best[0]):
+            best = (when, line)
+    return best
+
+
+def _since_seconds(since: str) -> int:
+    m = re.fullmatch(r"-?(\d+)\s*(s|sec|min|m|h|hour|d)?", since.strip())
+    if not m:
+        return 3600
+    n, unit = int(m.group(1)), (m.group(2) or "s")
+    return n * {"s": 1, "sec": 1, "m": 60, "min": 60, "h": 3600, "hour": 3600, "d": 86400}[unit]
+
+
+def _file_count(pattern: str, since: str) -> int:
+    """Matching lines newer than `since` across LOG_FILES. Only a line with
+    its own time can be counted, so stdout lines are not."""
+    floor = time.time() - _since_seconds(since)
+    n = 0
+    for path in LOG_FILES:
+        out = sh("bash", "-c", f"tail -n 400000 {json.dumps(path)} 2>/dev/null | "
+                 f"grep -aE {json.dumps(pattern)}", timeout=120)
+        for line in out.splitlines():
+            m = ISO.match(line)
+            if m and calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")) >= floor:
+                n += 1
+    return n
+
+
+def journal_first(unit: str, pattern: str) -> str:
+    """The first line of the CURRENT run matching `pattern`, or ''. For what the
+    node prints once at start (the payout address, the finalizer address, the
+    seed path): journald seeks to the run's first entry by its invocation id
+    and the line is within the first few thousand, so this is a short read,
+    where a backwards search from the newest entry walks through every
+    template and solver line the run has written since — minutes on a mining
+    node a day old. On a log file the run starts at the top of the file when
+    the file was rotated at start, else the fallback reads from the end."""
+    if LOG_FILES:
+        for path in LOG_FILES:
+            line = sh("bash", "-c", f"head -n 20000 {json.dumps(path)} 2>/dev/null | "
+                      f"grep -m 1 -aE {json.dumps(pattern)}").strip()
+            if line:
+                return line
+        return _file_last(pattern, None)[1]
+    inv = sh(*SYSTEMCTL, "show", "-p", "InvocationID", "--value", unit).strip()
+    if inv:
+        line = sh("bash", "-c", f"{JOURNALCTL} -u {unit} _SYSTEMD_INVOCATION_ID={inv} -o cat "
+                  f"--no-pager 2>/dev/null | head -n 20000 | grep -m 1 -aE {json.dumps(pattern)}",
+                  timeout=60).strip()
+        if line:
+            return line
+    return journal_last(unit, pattern, lines=None)
+
+
+def journal_last(unit: str, pattern: str, lines: int | None = 200_000) -> str:
+    """The newest journal line of `unit` matching `pattern`, or ''. With
+    --reverse, `-n` counts the entries shown, which under --grep are the
+    matches, so `-n 1` stops journalctl at the first hit. Piping into head
+    does not: journalctl block-buffers into a pipe and hears that head has
+    gone only when a later flush fails, so it read on until it had about
+    8 KB of matches, through every earlier run for a line printed once at
+    start (19.5 s against 0.07 s for the same search on a 1 GB journal).
+    A pattern that is not there is still a read of the unit's whole journal.
+    `lines` bounds only a read of LOG_FILES."""
+    if LOG_FILES:
+        return _file_last(pattern, lines)[1]
+    out = sh("bash", "-c",
+             f"{JOURNALCTL} -u {unit} -r -n 1 -o cat --no-pager --grep {json.dumps(pattern)} "
+             f"2>/dev/null", timeout=60)
+    return out.strip()
+
+
+def journal_last_at(unit: str, pattern: str, lines: int = 200_000) -> tuple[float | None, str]:
+    """journal_last, with the line's time. This output format prints
+    "-- No entries --" on stdout when nothing matches, so a line without a
+    time is no line."""
+    if LOG_FILES:
+        return _file_last(pattern, lines)
+    out = sh("bash", "-c",
+             f"{JOURNALCTL} -u {unit} -r -n 1 -o short-unix --no-pager --grep {json.dumps(pattern)} "
+             f"2>/dev/null").strip()
+    stamp, _, rest = out.partition(" ")
+    try:
+        return float(stamp), rest
+    except ValueError:
+        return None, ""
+
+
+def journal_count(unit: str, pattern: str, since: str = "-1h") -> int:
+    if LOG_FILES:
+        return _file_count(pattern, since)
+    out = sh("bash", "-c",
+             f"{JOURNALCTL} -u {unit} -o cat --no-pager --since {since} --grep {json.dumps(pattern)} "
+             f"2>/dev/null | wc -l")
+    try:
+        return int(out.strip() or 0)
+    except ValueError:
+        return 0
+
+
+class Rpc:
+    def __init__(self, url: str, timeout: float = 15):
+        self.url, self.timeout = url, timeout
+        self.error = None
+
+    def __call__(self, method: str, params=None):
+        """The result, or None — with the reason kept in `.error`."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                           "params": params if params is not None else []}).encode()
+        req = urllib.request.Request(self.url, data=body,
+                                     headers={"content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                reply = json.load(r)
+        except (urllib.error.URLError, OSError, ValueError) as err:
+            self.error = f"{method}: {err}"
+            return None
+        if reply.get("error"):
+            self.error = f"{method}: {reply['error'].get('message', reply['error'])}"
+            return None
+        return reply.get("result")
+
+
+def ctaz(zats) -> str:
+    try:
+        return f"{int(zats) / ZATS:,.3f} cTAZ"
+    except (TypeError, ValueError):
+        return DASH
+
+
+def ago(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {seconds % 3600 // 60}m"
+    return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
+
+
+def read_env(path: str) -> dict:
+    env = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return env
+
+
+# ─── the checks ──────────────────────────────────────────────────────────────
+
+def services() -> dict:
+    out = {}
+    for unit in UNITS:
+        state = sh(*SYSTEMCTL, "is-active", unit).strip() or "unknown"
+        if state == "unknown" or "not-found" in sh(*SYSTEMCTL, "show", "-p", "LoadState", unit):
+            continue                                   # a role this host does not have
+        if unit != NODE_UNIT and state != "active" and not enabled(unit):
+            continue                                   # left from a role this host no longer has
+        since = sh(*SYSTEMCTL, "show", "-p", "ActiveEnterTimestampMonotonic", unit).strip()
+        secs = None
+        try:
+            mono = int(since.split("=", 1)[1]) / 1e6
+            secs = time.clock_gettime(time.CLOCK_MONOTONIC) - mono
+        except (IndexError, ValueError):
+            pass
+        out[unit] = {"state": state, "for": ago(secs) if secs and secs > 0 else DASH}
+    return out
+
+
+def enabled(unit: str) -> bool:
+    return sh(*SYSTEMCTL, "is-enabled", unit).strip() == "enabled"
+
+
+def stake_timer() -> dict:
+    """The timer `crosslink-stake --timer install` wrote, if there is one:
+    whether it runs, whether its last pass failed, and the --to, --min, --keep
+    and --batch it stakes with, off the service's command line."""
+    if sh(*SYSTEMCTL, "show", "-p", "LoadState", "--value", f"{STAKE_UNIT}.timer").strip() != "loaded":
+        return {"installed": False}
+    cmd = sh(*SYSTEMCTL, "show", "-p", "ExecStart", "--value", f"{STAKE_UNIT}.service")
+
+    def arg(name: str, default: float | None = None):
+        m = re.search(rf"\s{re.escape(name)}\s+([^\s;]+)", cmd)
+        if default is None:
+            return m.group(1) if m else None
+        try:
+            return float(m.group(1)) if m else default
+        except ValueError:
+            return default
+
+    return {"installed": True,
+            "active": sh(*SYSTEMCTL, "is-active", f"{STAKE_UNIT}.timer").strip() == "active",
+            "failed": sh(*SYSTEMCTL, "is-failed", f"{STAKE_UNIT}.service").strip() == "failed",
+            "dry_run": " --dry-run" in cmd,
+            "to": arg("--to"), "min": arg("--min", 10.0), "keep": arg("--keep", 1.0),
+            "batch": arg("--batch", 1000.0)}
+
+
+def node_ready(listen: str | None) -> dict | None:
+    """What the node's own health server says (zebrad.toml, [health]): 200 at
+    the tip, 503 with the reason. None when the config has no listen address,
+    which is every build before v14."""
+    if not listen:
+        return None
+    out = {}
+    for path in ("healthy", "ready"):
+        try:
+            with urllib.request.urlopen(f"http://{listen}/{path}", timeout=5) as r:
+                out[path] = {"ok": True, "says": r.read(200).decode("utf-8", "replace").strip()}
+        except urllib.error.HTTPError as err:
+            out[path] = {"ok": False, "says": err.read(200).decode("utf-8", "replace").strip()}
+        except (urllib.error.URLError, OSError, ValueError) as err:
+            out[path] = {"ok": None, "says": str(err)}
+    return out
+
+
+def node(rpc: Rpc) -> dict:
+    info = rpc("getblockchaininfo") or {}
+    peers = rpc("getpeerinfo")
+    blocks = info.get("blocks")
+    estimated = info.get("estimatedheight")
+    progress = info.get("verificationprogress")
+    now = time.time()
+    rate, recent = None, False
+    try:
+        t0, h0 = open(STATE, encoding="utf-8").read().split()
+        dt = now - float(t0)
+        recent = dt < 30         # keep the older point, so two quick runs still give a rate
+        if blocks is not None and not recent:
+            rate = (int(blocks) - int(h0)) * 60 / dt
+    except (OSError, ValueError):
+        pass
+    if blocks is not None and not recent:
+        try:
+            with open(STATE, "w", encoding="utf-8") as f:
+                f.write(f"{now:.0f} {blocks}\n")
+        except OSError:
+            pass
+    synced = None
+    if blocks is not None and estimated is not None:
+        # zebra projects estimatedheight from the tip block's time at the 25 s
+        # target spacing, so a quiet five minutes reads as 12 blocks "behind"
+        # on a synced node; a syncing node is hundreds behind
+        synced = int(blocks) >= int(estimated) - 12
+    # On Crosslink the blocks flow over the state network (network_local_port,
+    # network_initial_peers), which the node logs as
+    #   zebra_state::new_network: tip height: Some(N), finalized height: Some(M), peers: ["key@fin/tip", …]
+    # so that list, not zebra's PoW p2p address book, is who this node is with.
+    state_line = journal_last(NODE_UNIT, "zebra_state::new_network: tip height")
+    m = re.search(r"peers: \[(.*?)\]", state_line)
+    state_peers = re.findall(r'"([^"@]+)@(\d+)/(\d+)"', m.group(1)) if m else []
+    return {
+        "chain": info.get("chain"),
+        "height": blocks,
+        "estimated_tip": estimated,
+        "behind": (int(estimated) - int(blocks)) if synced is not None else None,
+        "progress_pct": round(float(progress) * 100, 2) if progress is not None else None,
+        "synced": synced,
+        "blocks_per_minute": round(rate, 2) if rate is not None else None,
+        "peers": len(peers) if isinstance(peers, list) else None,
+        "state_peers": [{"key": k, "finalized": int(f), "tip": int(t)} for k, f, t in state_peers],
+        "rpc_error": rpc.error if not info else None,
+    }
+
+
+def finality(rpc: Rpc, height) -> dict:
+    activated = rpc("is_tfl_activated")
+    final = rpc("get_tfl_final_block_height_and_hash") or {}
+    fh = final.get("height") if isinstance(final, dict) else None
+    gap = (int(height) - int(fh)) if (height is not None and fh is not None) else None
+    # The finalized block the BFT side names must be a block THIS node has at
+    # that height. If it is not, this node is on a fork: the finalizers are
+    # finalizing another chain at the same heights, and the tip here is local.
+    raw = final.get("hash") if isinstance(final, dict) else None
+    if isinstance(raw, list):
+        # a build may send the 32 bytes as numbers, in the internal order
+        try:
+            final_hash = bytes(raw).hex()
+        except (TypeError, ValueError):
+            final_hash = ""
+    else:
+        final_hash = str(raw or "").lower()
+    ours = rpc("getblockhash", [int(fh)]) if fh is not None else None
+    in_chain = None
+    if final_hash and isinstance(ours, str):
+        in_chain = ours.lower() in (final_hash, bytes.fromhex(final_hash)[::-1].hex()
+                                    if len(final_hash) == 64 else final_hash)
+    # A build past v14 (upstream main 41f3517d) drops BFT instead of exiting
+    # when following a decision would need a reorganization deeper than the
+    # reorg limit: the node keeps mining as proof of work with the finalized
+    # height frozen, logs this line at the drop and every ten minutes after,
+    # and no RPC says so (is_tfl_activated stays true). Only a resync brings
+    # it back. A line within the last quarter hour is the node saying it now.
+    stopped_at, stopped_line = journal_last_at(NODE_UNIT, "BFT is stopped on this node")
+    bft_stopped = bool(stopped_line) and stopped_at is not None and (time.time() - stopped_at) < 900
+    roster = rpc("get_tfl_roster_zats") or []
+    total = sum(int(m.get("voting_power", 0)) for m in roster) if isinstance(roster, list) else None
+    ranked = sorted(roster, key=lambda r: -int(r.get("voting_power", 0))) if isinstance(roster, list) else []
+    return {
+        "activated": activated,
+        "finalized_height": fh,
+        "finality_gap": gap,
+        "finalized_block_in_this_chain": in_chain,
+        "bft_stopped": bft_stopped,
+        "bft_stopped_since": ago(time.time() - stopped_at) if bft_stopped else None,
+        "finalizers": len(roster) if isinstance(roster, list) else None,
+        "total_stake": ctaz(total) if total is not None else DASH,
+        # every finalizer stake points at, largest first: the active roster is
+        # the largest few of these (the cap is the build's, not read here)
+        "roster": [{"key": str(m.get("pub_key", ""))[:12] + "…", "stake": ctaz(m.get("voting_power")),
+                    "zats": int(m.get("voting_power", 0))} for m in ranked],
+        "_roster": roster if isinstance(roster, list) else [],
+    }
+
+
+def staking_day(height, env: dict) -> dict:
+    """Where the chain is in its staking cycle: a new stake is accepted only in
+    the first `window` blocks of every `period` (chain.env's values when the
+    host has them; the protocol's defaults otherwise)."""
+    try:
+        period = int(env.get("STAKING_PERIOD_BLOCKS", 150))
+        window = int(env.get("STAKING_WINDOW_BLOCKS", 70))
+        start = int(env.get("STAKING_START_BLOCK", 0) or 0)
+    except ValueError:
+        period, window, start = 150, 70, 0
+    if height is None:
+        return {"open": None}
+    pos = int(height) % period
+    open_now = pos < window
+    # a chain that bootstraps from pure proof-of-work (v14): no staking action
+    # is valid below `start`, whatever the calendar says
+    before = int(height) < start
+    return {"open": open_now and not before, "block_in_cycle": pos, "period": period,
+            "window": window, "start": start, "before_start": before,
+            "closes_in": (window - pos) if (open_now and not before) else None,
+            "opens_in": (start - int(height)) if before else ((period - pos) if not open_now else None)}
+
+
+def finalizer_key(address: str) -> str | None:
+    """The 32-byte BFT key inside a finalizer address, as hex — or None."""
+    if not address.startswith("zfinv1") or len(address) != 134:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(address[6:])
+    except ValueError:
+        return None
+    return raw[:32].hex() if len(raw) == 96 else None
+
+
+def this_finalizer(roster: list) -> dict:
+    line = journal_first(NODE_UNIT, "finalizer address: zfinv1")
+    m = re.search(r"zfinv1[A-Za-z0-9_-]{128}", line)
+    address = m.group(0) if m else None
+    key = finalizer_key(address) if address else None
+    seat = None
+    if key:
+        forms = {key, bytes.fromhex(key)[::-1].hex()}      # the roster lists a key in either byte order
+        ranked = sorted(roster, key=lambda r: -int(r.get("voting_power", 0)))
+        for i, member in enumerate(ranked, 1):
+            if member.get("pub_key") in forms:
+                seat = {"rank": i, "of": len(ranked), "stake": ctaz(member.get("voting_power"))}
+                break
+    return {"address": address or DASH, "on_roster": bool(seat), "seat": seat}
+
+
+def wallet_t_address() -> str | None:
+    """The wallet's own transparent address: printed at start ("USER WALLET
+    T-ADDRESS:"), or logged as "Mining to t…" while no miner_address is set;
+    the host summary keeps a copy."""
+    for pattern, take in (("USER WALLET T-ADDRESS: +t", r"T-ADDRESS: +(t[1-9A-HJ-NP-Za-km-z]{20,})"),
+                          ("Mining to t", r"Mining to (t[1-9A-HJ-NP-Za-km-z]{20,})")):
+        m = re.search(take, journal_first(NODE_UNIT, pattern))
+        if m:
+            return m.group(1)
+    try:
+        m = re.search(r"\| payout address \| `(t[1-9A-HJ-NP-Za-km-z]{20,})`",
+                      open(HOST_README, encoding="utf-8").read())
+    except OSError:
+        m = None
+    return m.group(1) if m else None
+
+
+def mining(rpc: Rpc, cfg: dict) -> dict:
+    """The miner, and where its rewards go: the configured miner_address, or
+    the wallet's own transparent address when none is set. A unified
+    address (u…) is paid shielded: no balance to read off the chain; the
+    wallet's figures (wallet_spendable_funds) are the ones."""
+    on = bool(cfg.get("mining", {}).get("internal_miner"))
+    address = cfg.get("mining", {}).get("miner_address") or wallet_t_address()
+    shielded = bool(address) and not str(address).startswith("t")
+    balance = (rpc("getaddressbalance", [{"addresses": [address]}])
+               if address and not shielded else None)
+    templates = journal_count(NODE_UNIT, "mining with an updated block template", "-10min") if on else 0
+    return {
+        "miner_on": on,
+        "payout_address": address or DASH,
+        "payout_shielded": shielded,
+        "balance": ctaz(balance.get("balance")) if isinstance(balance, dict) else DASH,
+        "received": ctaz(balance.get("received")) if isinstance(balance, dict) else DASH,
+        "templates_last_10min": templates if on else None,
+    }
+
+
+def wallet(rpc: Rpc, cfg: dict, payout: str, height) -> dict:
+    """`payout` is the transparent address the wallet reads (its own), or
+    DASH; a unified payout address is the wallet's shielded side, read below
+    from wallet_spendable_funds."""
+    off = bool(cfg.get("crosslink", {}).get("disable_the_headless_wallet", True))
+    if off:
+        return {"enabled": False}
+    out = {"enabled": True, "started": bool(rpc("get_wallet_ufvk"))}
+    if payout != DASH and not payout.startswith("t"):
+        payout = wallet_t_address() or DASH
+    # The wallet reads its transparent address in ranges and logs each one:
+    # "Downloading t txs in A-B for w.s/t…". A coin past B is unknown to it,
+    # and a line that stops coming is a wallet loop that has stalled.
+    if payout != DASH:
+        when, line = journal_last_at(NODE_UNIT, f"Downloading t txs in [0-9]+-[0-9]+ for .*/{payout}")
+        m = re.search(r"Downloading t txs in \d+-(\d+)", line)
+        if m and when is not None:
+            read_to, now = int(m.group(1)), time.time()
+            out["read_to"] = read_to
+            out["read_seconds_ago"] = int(now - when)
+            if height is not None:
+                out["read_behind"] = max(int(height) - read_to, 0)
+            # how fast it reads, from this run and the last, like the block rate
+            # the state is "time position speed": a run within 30 s of the
+            # saved point keeps it and shows the speed measured last time
+            recent = False
+            try:
+                t0, r0, *last = open(WALLET_STATE, encoding="utf-8").read().split()
+                dt = now - float(t0)
+                recent = dt < 30 and read_to >= int(r0)
+                if recent and last and int(last[0]) > 0:
+                    out["read_per_minute"] = int(last[0])
+                elif not recent and read_to > int(r0):
+                    out["read_per_minute"] = int((read_to - int(r0)) * 60 / dt)
+            except (OSError, ValueError):
+                pass
+            if not recent:
+                try:
+                    with open(WALLET_STATE, "w", encoding="utf-8") as f:
+                        f.write(f"{now:.0f} {read_to} {out.get('read_per_minute', 0)}\n")
+                except OSError:
+                    pass
+        # what a stake can spend: the payout address's coins, less the young ones
+        utxos = rpc("getaddressutxos", [{"addresses": [payout]}])
+        if isinstance(utxos, list) and height is not None:
+            settled = sum(int(u.get("satoshis", 0)) for u in utxos
+                          if int(u.get("height", height)) <= int(height) - SETTLE)
+            out["spendable_zats"] = settled
+            out["spendable"] = ctaz(settled)
+            out["younger"] = ctaz(sum(int(u.get("satoshis", 0)) for u in utxos) - settled)
+    # a build with the headless wallet answers this; without it the figures
+    # above are the ones
+    funds = rpc("wallet_spendable_funds")
+    if isinstance(funds, dict):
+        # shielded notes a stake or a send is built from (3 confirmations) ·
+        # received too recently · already consumed by a send of ours not yet
+        # mined · transparent · the wallet's own tip. The wallet spends the
+        # notes first, so a stake can draw on both figures.
+        out["funds"] = {"address": funds.get("address") or DASH,
+                        "spendable_zats": int(funds.get("spendable_zats") or 0),
+                        "spendable": ctaz(funds.get("spendable_zats")),
+                        "pending": ctaz(funds.get("pending_zats")),
+                        "committed": ctaz(funds.get("committed_zats")),
+                        "unshielded": ctaz(funds.get("unshielded_zats")),
+                        "tip_height": funds.get("tip_height")}
+        out["stakeable_zats"] = out["funds"]["spendable_zats"] + out.get("spendable_zats", 0)
+    elif "spendable_zats" in out:
+        out["stakeable_zats"] = out["spendable_zats"]
+    mismatches = journal_count(NODE_UNIT, "WALLET TREE ROOT MISMATCH", "-1h")
+    desyncs = journal_count(NODE_UNIT, "WALLET TREE DESYNC", "-1h")
+    out.update({"tree_mismatch_lines_last_hour": mismatches, "tree_desync_lines_last_hour": desyncs})
+    # "WALLET TREE ROOT MISMATCH" is expected on this build: the wallet's tree
+    # holds Ironwood commitments (every shielded transfer since NU6.3), and the
+    # check compares it with the node's ORCHARD tree, which nothing moves —
+    # its root is the same in every line. "WALLET TREE DESYNC" is the real one:
+    # a rewind the in-memory tree could not follow; a restart rebuilds it.
+    if mismatches:
+        out["note"] = ("mismatch lines are expected (the check compares the wallet's "
+                       "Ironwood tree with the node's Orchard tree); not a fault")
+    if desyncs:
+        out["note"] = ("the wallet's tree could not follow a rewind; it is rebuilt in "
+                       "memory on restart — restart the node once it is synced")
+    return out
+
+
+def stakes(rpc: Rpc, roster: list) -> dict:
+    """What this wallet has staked. The wallet lists each finalizer by the key
+    in the form the stake call took; the roster counts the stake under the
+    byte-reversed form."""
+    positions = rpc("wallet_staking_positions")
+    if not isinstance(positions, dict):
+        return {"available": False, "error": rpc.error}
+    ranked = sorted(roster, key=lambda r: -int(r.get("voting_power", 0)))
+    keys = [str(m.get("pub_key", "")).lower() for m in ranked]
+    to = []
+    for sent_as, bonds in sorted((positions.get("active") or {}).items()):
+        try:
+            key = bytes.fromhex(sent_as)[::-1].hex()
+        except ValueError:
+            continue
+        to.append({
+            "finalizer": key,
+            "rank": keys.index(key) + 1 if key in keys else None,
+            "of": len(keys),
+            "stakes": len(bonds),
+            "staked": sum(int(b.get("initial_val", 0)) for b in bonds),
+            "now": sum(int(b.get("latest_val", 0)) for b in bonds),
+        })
+    withdrawable = positions.get("withdrawable") or []
+    return {"available": True, "to": to,
+            "withdrawable": len(withdrawable),
+            "withdrawable_zats": sum(int(b.get("latest_val", 0)) for b in withdrawable)}
+
+
+def ready_to_stake(r: dict) -> tuple[bool, str]:
+    """Would crosslink-stake --all go ahead now, and if not, why not."""
+    w, sd, n = r["wallet"], r["staking_day"], r["node"]
+    if not w.get("started"):
+        return False, "the wallet has not started"
+    if not n.get("synced"):
+        return False, "the node is not synced"
+    if "read_to" in w and w["read_to"] < (n["height"] or 0) - 5:
+        return False, "the wallet has not read the payout address up to the tip"
+    if sd.get("open") is None:
+        return False, "Staking Day unknown"
+    if sd.get("before_start"):
+        return False, f"no stake is valid before block {sd['start']:,}"
+    if sd["block_in_cycle"] >= sd["window"] - MARGIN:
+        opens = sd["period"] - sd["block_in_cycle"]
+        return False, (f"Staking Day closed, opens in {opens} blocks" if not sd["open"]
+                       else f"Staking Day closes in {sd['closes_in']} blocks, too close to its end")
+    fu = w.get("funds") or {}
+    if fu.get("tip_height") is not None and int(fu["tip_height"]) < (n["height"] or 0) - 5:
+        return False, "the wallet has not read its notes up to the tip"
+    if "stakeable_zats" not in w:
+        return False, "neither the payout address nor the wallet's notes are known here"
+    t = r.get("stake_timer") or {}
+    least, keep, batch = ((t["min"], t["keep"], t["batch"]) if t.get("installed")
+                          else (1.0, 1.0, 1000.0))
+    amount = (w["stakeable_zats"] - round(keep * ZATS)) // ZATS * ZATS
+    if amount < max(round(least * ZATS), ZATS):
+        return False, (f"{ctaz(w['stakeable_zats'])} spendable, {ctaz(round(keep * ZATS))} kept: "
+                       f"under the {least:g} cTAZ minimum")
+    split = pieces(amount, round(batch * ZATS), max(pow10_floor(round(least * ZATS)), ZATS))
+    if len(split) > 1:
+        return True, f"{ctaz(sum(split))}, as {len(split)} stakes of up to {ctaz(max(split))}"
+    return True, ctaz(sum(split))
+
+
+def pow10_floor(n: int) -> int:
+    return 10 ** (len(str(n)) - 1) if n >= 1 else 0
+
+
+def pieces(total: int, size: int, floor: int) -> list[int]:
+    """How crosslink-stake splits a stake (its batches()): a stake is a power of
+    10 zats, the only amount v15's wallet takes, so the pieces are 1, 10, 100 …
+    cTAZ, largest first, none over --batch and none under --min rounded down."""
+    split, left = [], total
+    while (piece := pow10_floor(min(size, left))) >= floor:
+        split.append(piece)
+        left -= piece
+    return split
+
+
+
+# ─── output ──────────────────────────────────────────────────────────────────
+
+def show(v) -> str:
+    if v is None:
+        return DASH
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    return f"{v:,}" if isinstance(v, int) else str(v)
+
+
+# Colour only for a person at a terminal: green is fine, yellow is wait or
+# look, red is act. Nothing else is coloured, so the colour is the signal.
+COLOR = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+         and "--no-color" not in sys.argv[1:])
+
+
+def paint(code: str):
+    return lambda text: f"\033[{code}m{text}\033[0m" if COLOR else str(text)
+
+
+good, warn, bad, dim, bold = paint("32"), paint("33"), paint("1;31"), paint("2"), paint("1")
+
+
+def kctaz(zats) -> str:
+    """cTAZ in K/M, for the roster summary."""
+    v = int(zats) / ZATS
+    return f"{v / 1e6:.2f}M" if v >= 1e6 else f"{v / 1e3:.0f}K" if v >= 1e3 else f"{v:.0f}"
+
+
+def print_report(r: dict, full_roster: bool = False) -> None:
+    W = 11
+
+    def row(label: str, *parts) -> None:
+        text = " · ".join(str(x) for x in parts if x not in (None, ""))
+        print(bold(label.ljust(W)) + text if label else " " * W + text)
+
+    print(dim(f"crosslink-check  {r['read_at'].replace('T', ' ').rstrip('Z')} UTC"))
+
+    units = [f"{u} {good(v['state']) if v['state'] == 'active' else bad(v['state'])} {v['for']}"
+             for u, v in r["services"].items()]
+    row("SERVICES", *(units or [dim("none found")]))
+
+    n = r["node"]
+    if n.get("rpc_error"):
+        row("NODE", bad(f"RPC not answering: {n['rpc_error']}"))
+    else:
+        if n["synced"] is None:
+            verdict = DASH
+        elif n["synced"]:
+            verdict = good("synced")
+        else:
+            verdict = warn(f"syncing, {show(n['behind'])} behind ({show(n['progress_pct'])}%)")
+        rate = f"{n['blocks_per_minute']} blocks/min" if n["blocks_per_minute"] is not None else None
+        row("NODE", f"{show(n['height'])} of ~{show(n['estimated_tip'])}", verdict, rate,
+            f"PoW peers {show(n['peers'])}")
+        sp, h = n["state_peers"], n["height"] or 0
+        if sp:
+            # the state network is who the blocks come from and go to; a peer
+            # level with this node is expected, many ahead of it is not
+            level = [p for p in sp if abs(p["tip"] - h) <= 2]
+            ahead = [p for p in sp if p["tip"] > h + 2]
+            behind = [p for p in sp if p["tip"] < h - 2]
+            parts = [f"state peers {len(sp)}: {len(level)} level with this node"]
+            if ahead:
+                parts.append(warn(f"{len(ahead)} ahead, to {max(p['tip'] for p in ahead):,}"))
+            if behind:
+                shown = ", ".join(f"{p['key']} {p['tip']:,}" for p in behind[:3])
+                parts.append(dim(f"{len(behind)} behind ({shown}{', …' if len(behind) > 3 else ''})"))
+            row("", *parts)
+        elif n["peers"] == 0:
+            row("", bad("no peers on either network: blocks mined here reach nobody"))
+        hs = n.get("health")
+        if hs:
+            # the node's own answer, beside this script's reading of the RPC
+            said = []
+            for path in ("healthy", "ready"):
+                h = hs.get(path) or {}
+                if h.get("ok") is None:
+                    said.append(warn(f"/{path} not answering: {h.get('says')}"))
+                elif h["ok"]:
+                    said.append(f"/{path} {good('ok')}")
+                else:
+                    said.append(f"/{path} {bad(h.get('says') or 'not ok')}")
+            row("", "node says", *said)
+
+    f = r["finality"]
+    chain = {True: good("in this node's chain"),
+             False: bad("NOT in this node's chain: this node is on a fork"),
+             None: None}[f["finalized_block_in_this_chain"]]
+    starts = None
+    if f["activated"] is False and f.get("activation_block") and r["node"].get("height") is not None:
+        to_go = int(f["activation_block"]) - int(r["node"]["height"])
+        starts = (f"starts at block {int(f['activation_block']):,}, {to_go:,} to go" if to_go > 0
+                  else f"starts at block {int(f['activation_block']):,}")
+    row("FINALITY", None if f["activated"] is not False else warn("not activated"), starts,
+        f"finalized {show(f['finalized_height'])}", f"gap {show(f['finality_gap'])}", chain)
+    if f.get("bft_stopped"):
+        row("", bad(f"BFT STOPPED on this node, said {f['bft_stopped_since']} ago: it mines without finality"),
+            "a decision needed a reorganization past the reorg limit; delete the database and resync")
+    top = " · ".join(f"{m['key'][:8]}… {kctaz(m['zats'])}" for m in f["roster"][:3])
+    row("", f"roster {show(f['finalizers'])} finalizers, {f['total_stake']}",
+        f"largest: {top}" if top else None)
+    if full_roster:
+        for i, m in enumerate(f["roster"], 1):
+            row("", f"{i:>3}. {m['key']}  {m['stake']}")
+    sd = r["staking_day"]
+    if sd["open"] is None:
+        row("", f"Staking Day {DASH}")
+    elif sd.get("before_start"):
+        row("", f"Staking Day {warn('none yet')}: no stake is valid before block {sd['start']:,}, "
+                f"{sd['opens_in']:,} to go")
+    elif sd["open"]:
+        row("", f"Staking Day {good('open')}: block {sd['block_in_cycle']} of {sd['period']}, "
+                f"closes in {sd['closes_in']} blocks")
+    else:
+        row("", f"Staking Day {warn('closed')}: block {sd['block_in_cycle']} of {sd['period']}, "
+                f"opens in {sd['opens_in']} blocks")
+
+    # a chain that starts as proof of work alone (v14) has no roster before its
+    # first finalizers are chosen, so nobody is missing from it yet
+    no_roster = None
+    if not f["finalizers"] and f["activated"] is False and r["node"].get("height") is not None:
+        rb = f.get("roster_block") or 0
+        no_roster = (f"no roster yet: the first finalizers are chosen from the stake at block {rb:,}, "
+                     f"{rb - int(r['node']['height']):,} to go" if rb > int(r["node"]["height"])
+                     else "no roster before finality starts")
+    t = r["finalizer"]
+    if t["address"] != DASH:
+        seat = (good(f"rank {t['seat']['rank']} of {t['seat']['of']}, {t['seat']['stake']}") if t["seat"]
+                else dim(no_roster) if no_roster
+                else warn("not on the roster (no stake points at it, or outside the active cap)"))
+        row("FINALIZER", seat)
+        # the whole address, on its own line: it is what a delegator stakes to
+        row("", t["address"])
+    else:
+        row("FINALIZER", dim("address not in the journal: the node has not logged it this run, "
+                            "or run this with sudo"))
+
+    m = r["mining"]
+    templates = (f"{m['templates_last_10min']} templates/10 min" if m["miner_on"] else None)
+    row("MINING", good("on") if m["miner_on"] else dim("off"),
+        ("payout shielded, to this wallet" if m.get("payout_shielded") else f"payout {m['payout_address']}"),
+        None if m.get("payout_shielded") else f"balance {m['balance']}", templates)
+    if m.get("payout_shielded"):
+        row("", m["payout_address"])
+
+    w = r["wallet"]
+    if not w["enabled"]:
+        row("WALLET", dim("off (crosslink_disable_wallet)"))
+    else:
+        parts = [good("started") if w["started"] else warn("not started yet")]
+        if "read_to" in w:
+            behind = w.get("read_behind", 0)
+            height = r["node"]["height"] or 0
+            if behind <= 5:
+                parts.append(good(f"read to the tip ({w['read_to']:,})"))
+            elif w["read_seconds_ago"] > 600:
+                # it logs a read only when new blocks arrive: quiet is normal,
+                # quiet and behind a node that has moved on is a wallet that
+                # has stopped
+                parts.append(bad(f"stopped at {w['read_to']:,}, {ago(w['read_seconds_ago'])} ago: "
+                                 "restart the node once it is synced"))
+            else:
+                # after a restart the wallet reads the chain from the start
+                # again; it can stake only coins it has read
+                left = (f", {w['read_per_minute']:,}/min, about {ago(behind / w['read_per_minute'] * 60)} left"
+                        if w.get("read_per_minute") else ", run again in a minute for its speed")
+                parts.append(warn(f"reading: {w['read_to']:,} of {height:,}, {behind:,} behind{left}"))
+        else:
+            parts.append(dim("read position not in the journal"))
+        row("WALLET", *parts)
+        tree = []
+        if w["tree_desync_lines_last_hour"]:
+            tree.append(bad(f"tree desync ×{w['tree_desync_lines_last_hour']}/h: restart once synced"))
+        if w["tree_mismatch_lines_last_hour"]:
+            tree.append(dim(f"tree mismatch ×{w['tree_mismatch_lines_last_hour']}/h (expected)"))
+        if "spendable" in w or tree:
+            row("", f"spendable {w['spendable']} (rewards older than {SETTLE} blocks), {w['younger']} younger"
+                if "spendable" in w else None, *tree)
+        if "funds" in w:
+            fu = w["funds"]
+            row("", f"shielded notes: spendable {fu['spendable']}", f"pending {fu['pending']}",
+                f"committed {fu['committed']}", f"unshielded {fu['unshielded']}",
+                f"read to {fu['tip_height']:,}" if fu.get("tip_height") is not None else None)
+
+    st = r.get("stakes")
+    if st is not None:
+        if not st["available"]:
+            row("STAKES", dim(f"{DASH} ({st['error']})"))
+        else:
+            label = "STAKES"
+            if not st["to"]:
+                row(label, "none yet")
+                label = ""
+            for s_ in st["to"]:
+                seat = (f"rank {s_['rank']} of {s_['of']}" if s_["rank"]
+                        else "no roster yet" if no_roster else warn("not on the roster"))
+                row(label, f"{s_['stakes']} to {s_['finalizer'][:8]}…{s_['finalizer'][-4:]} ({seat})",
+                    f"{ctaz(s_['staked'])} staked", f"{ctaz(s_['now'])} now")
+                label = ""
+            if st["withdrawable"]:
+                row("", f"{st['withdrawable']} unstaked, ready to withdraw: {ctaz(st['withdrawable_zats'])}")
+            t = r.get("stake_timer") or {}
+            if t.get("failed"):
+                row("", bad("the last stake pass failed"), f"{JOURNALCTL} -u {STAKE_UNIT} -n 40")
+            ok, why = ready_to_stake(r)
+            if not ok:
+                row("", warn(f"not ready to stake: {why}"))
+            elif t.get("active"):
+                row("", good(f"ready to stake {why}"),
+                    "the timer stakes it" + (" (dry run)" if t["dry_run"] else ""),
+                    "crosslink-stake --timer status")
+            else:
+                # a build that stakes to a finalizer address (v14 on) logs one at start
+                to = t.get("to") or ("<finalizer address>" if r["finalizer"]["address"] != DASH
+                                     else st["to"][0]["finalizer"] if len(st["to"]) == 1 else "<key>")
+                row("", good(f"ready to stake {why}"))
+                row("", bold(f"sudo crosslink-stake --to {to} --all"))
+
+
+
+def main() -> int:
+    try:
+        cfg = tomllib.load(open(CONFIG, "rb"))
+    except (OSError, tomllib.TOMLDecodeError) as err:
+        print(f"crosslink-check: cannot read {CONFIG}: {err} (run as root)", file=sys.stderr)
+        return 1
+    rpc = Rpc(f"http://{cfg.get('rpc', {}).get('listen_addr', '127.0.0.1:8232')}/")
+    env = read_env(CHAIN_ENV)
+
+    # CROSSLINK_CHECK_TIMING=1 says on stderr how long each step took
+    timing = bool(os.environ.get("CROSSLINK_CHECK_TIMING"))
+    t0 = [time.monotonic()]
+
+    def lap(step: str) -> None:
+        if timing:
+            now = time.monotonic()
+            print(f"{step:<12}{now - t0[0]:6.2f} s", file=sys.stderr)
+            t0[0] = now
+
+    report = {"read_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    report["services"] = services()
+    lap("services")
+    report["node"] = node(rpc)
+    report["node"]["health"] = node_ready((cfg.get("health") or {}).get("listen_addr"))
+    lap("node")
+    report["finality"] = finality(rpc, report["node"]["height"])
+    lap("finality")
+    for key, name in (("activation_block", "BFT_ACTIVATION_BLOCK"), ("roster_block", "ROSTER_BLOCK")):
+        try:
+            report["finality"][key] = int(env.get(name, 0) or 0)
+        except ValueError:
+            report["finality"][key] = 0
+    report["staking_day"] = staking_day(report["node"]["height"], env)
+    roster = report["finality"].pop("_roster")
+    report["finalizer"] = this_finalizer(roster)
+    lap("finalizer")
+    report["mining"] = mining(rpc, cfg)
+    lap("mining")
+    report["wallet"] = wallet(rpc, cfg, report["mining"]["payout_address"], report["node"]["height"])
+    lap("wallet")
+    if report["wallet"]["enabled"]:
+        report["stake_timer"] = stake_timer()
+        report["stakes"] = stakes(rpc, roster)
+        lap("stakes")
+
+    if "--json" in sys.argv[1:]:
+        print(json.dumps(report, indent=2))
+    else:
+        print_report(report, full_roster="--roster" in sys.argv[1:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

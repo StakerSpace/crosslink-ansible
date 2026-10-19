@@ -1,0 +1,126 @@
+---
+# Safety checks. Every check must pass on every host before anything runs.
+
+- name: Refuse hosts on forbidden_hostnames
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname not in forbidden_hostnames
+      - ansible_facts.hostname not in forbidden_hostnames
+      - ansible_facts.nodename not in forbidden_hostnames
+    fail_msg: >-
+      {{ inventory_hostname }} (hostname {{ ansible_facts.hostname }}) is on
+      forbidden_hostnames. It holds a finalizer identity. Remove it from the
+      inventory.
+    quiet: true
+
+- name: Detect running zebrad
+  ansible.builtin.command: pgrep -fa '[z]ebrad'
+  register: preflight_zebrad
+  failed_when: false
+  changed_when: false
+
+- name: Refuse hosts already running zebrad
+  ansible.builtin.fail:
+    msg: >-
+      zebrad is already running on {{ inventory_hostname }}:
+      {{ preflight_zebrad.stdout_lines | join(' | ') }}.
+      If this is a finalizer you run by hand, remove it from the inventory.
+      If this playbook installed it, set allow_existing_zebrad=true.
+  when:
+    - preflight_zebrad.rc == 0
+    - not (allow_existing_zebrad | bool)
+    # zebrad at our own install path was installed by this playbook
+    - (crosslink_home + '/bin/zebrad') not in (preflight_zebrad.stdout | default(''))
+
+# ─── Inventory checks ────────────────────────────────────────────────────────
+
+- name: Check the network has a row
+  ansible.builtin.assert:
+    that: crosslink_network in crosslink_chains or crosslink_network == 'featurenet-v14'
+    fail_msg: >-
+      crosslink_network is "{{ crosslink_network }}", and crosslink_chains in
+      group_vars/all/main.yml has no row of that name. Use one of
+      {{ crosslink_chains | list | join(', ') }}.
+    quiet: true
+
+- name: Check the host is in a role group
+  ansible.builtin.assert:
+    that: >-
+      inventory_hostname in (groups['node'] | default([]))
+      or inventory_hostname in (groups['miner'] | default([]))
+      or inventory_hostname in (groups['finalizer'] | default([]))
+    fail_msg: >-
+      {{ inventory_hostname }} is in none of the groups node, miner or
+      finalizer, so no play targets it. Put it in one.
+    quiet: true
+
+# The identity string is hashed into the node's state-network key, so a
+# copied example is a copied identity: every host that copies it would share
+# one identity. Nothing is accepted but a string of the host's own.
+- name: Refuse a missing or copied identity string
+  ansible.builtin.assert:
+    that:
+      - crosslink_identity_seed | default('') | length >= 16
+      - "'CHANGE-ME' not in crosslink_identity_seed"
+      - crosslink_identity_seed != '6b1e0d9c4a7f2e35c8d1b0a9f3e7c642'
+    fail_msg: >-
+      crosslink_identity_seed for {{ inventory_hostname }} is
+      {{ 'not set' if not (crosslink_identity_seed | default('')) else 'the placeholder, the documented example, or under 16 characters' }}.
+      blake3 of this string is the node's state-network key, so it must be the
+      host's own. Make one and put it under the host in the inventory:
+      openssl rand -hex 16
+    quiet: true
+
+# ─── Mining checks ───────────────────────────────────────────────────────────
+
+- name: Check payout address format
+  ansible.builtin.assert:
+    that: crosslink_miner_address is match('^(t[1-9A-HJ-NP-Za-km-z]{20,}|u(test)?1[a-z0-9]{20,})$')
+    fail_msg: >-
+      crosslink_miner_address "{{ crosslink_miner_address }}" is not a
+      transparent (t…) or unified (u…) address. Leave it empty to use the
+      seed-derived address.
+    quiet: true
+  when:
+    - crosslink_mining_enabled | bool
+    - crosslink_miner_address | length > 0
+
+- name: Check coinbase data length
+  ansible.builtin.assert:
+    that: crosslink_miner_extra_coinbase_data | length <= 95
+    fail_msg: >-
+      crosslink_miner_extra_coinbase_data is
+      {{ crosslink_miner_extra_coinbase_data | length }} bytes. Max is about 95.
+    quiet: true
+  when:
+    - crosslink_mining_enabled | bool
+    - crosslink_miner_extra_coinbase_data | length > 0
+
+- name: Check the solver thread count
+  ansible.builtin.assert:
+    that:
+      - crosslink_miner_threads | int >= 1
+      - crosslink_miner_threads | int <= (ansible_facts.processor_vcpus | default(256))
+    fail_msg: >-
+      crosslink_miner_threads is {{ crosslink_miner_threads }}; the host has
+      {{ ansible_facts.processor_vcpus | default('an unknown number of') }}
+      cores. Use 1 to the core count; leave two cores to the node itself.
+    quiet: true
+  when: crosslink_mining_enabled | bool
+
+# ─── Key bundle check ────────────────────────────────────────────────────────
+
+- name: Check key bundle directory is outside the repository
+  ansible.builtin.assert:
+    that:
+      - crosslink_keys_dir | length > 0
+      - not (crosslink_keys_dir | realpath).startswith(playbook_dir | realpath)
+    fail_msg: >-
+      crosslink_keys_dir ({{ crosslink_keys_dir }}) is inside the repository.
+      It will hold private keys. Point it outside the working tree.
+    quiet: true
+  run_once: true
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false

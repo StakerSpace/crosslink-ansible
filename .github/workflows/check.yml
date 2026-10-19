@@ -1,0 +1,34 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Ansible
+        run: |
+          pip install ansible-core ansible-lint pyyaml
+          ansible-galaxy collection install -r requirements.yml
+      - name: Syntax check every playbook
+        run: |
+          for p in site.yml reset.yml restore.yml rewards.yml; do
+            ansible-playbook -i inventory.example.yml --syntax-check "$p"
+          done
+      - name: Every template variable is defined
+        run: python3 check-templates.py
+      - name: Scripts compile and the seed tool checks itself
+        run: |
+          python3 -m py_compile roles/crosslink_node/files/crosslink-check \
+            roles/crosslink_node/files/crosslink-stake \
+            roles/crosslink_node/files/chain-params.py \
+            roles/node_identity/files/rewards.py tools/seed-tool.py
+          python3 tools/seed-tool.py --selftest
+      - name: Lint
+        run: ansible-lint --offline

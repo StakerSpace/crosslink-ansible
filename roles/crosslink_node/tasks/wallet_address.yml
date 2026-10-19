@@ -1,0 +1,64 @@
+---
+# The wallet's own unified address, for crosslink_miner_shielded: the address
+# the coinbase then pays. The node answers it (wallet_spendable_funds) once
+# the wallet has made a pass, and prints it at start before that ("USER
+# WALLET ADDRESS:", wallet/src/lib.rs); the host summary keeps a copy for a
+# journal that has rotated past the line. Nothing is derived: a wrong
+# address here would pay every block to somebody else, so only what this
+# node said is written. Sets crosslink_wallet_address, "" when unknown.
+# `wallet_address_wait` true waits for the line, up to two minutes: on the
+# first start the wallet prints it a few seconds after the node is up.
+
+- name: Ask the node for its wallet address
+  ansible.builtin.uri:
+    url: "http://{{ crosslink_rpc_listen }}/"
+    method: POST
+    body_format: json
+    body: {"jsonrpc": "2.0", "id": "wallet", "method": "wallet_spendable_funds", "params": []}
+    return_content: true
+    status_code: [200, 500]
+  register: wallet_address_rpc
+  failed_when: false
+
+- name: Read the wallet address from the node log
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      svc={{ crosslink_service_name | quote }}
+      inv=$(systemctl show -p InvocationID --value "$svc" 2>/dev/null)
+      if [ -n "$inv" ]; then
+        journalctl -u "$svc" _SYSTEMD_INVOCATION_ID="$inv" -o cat --no-pager 2>/dev/null \
+          | head -n 20000 | grep -aoE 'USER WALLET ADDRESS: +u[a-z0-9]{20,}' | head -n 1
+      fi
+      if [ -r {{ (crosslink_config_dir ~ '/README.md') | quote }} ]; then
+        grep -aoE '\| wallet address \| `u[a-z0-9]{20,}`' {{ (crosslink_config_dir ~ '/README.md') | quote }} | head -n 1
+      fi
+      true
+  register: wallet_address_log
+  changed_when: false
+  failed_when: false
+  until: >-
+    not (wallet_address_wait | default(false) | bool)
+    or (wallet_address_log.stdout | regex_search('u[a-z0-9]{20,}'))
+    or ((wallet_address_rpc.json | default({})).result | default({})).address | default('') | length > 0
+  retries: 24
+  delay: 5
+  ignore_errors: true   # the assert after the start names the fix
+
+- name: Set the wallet address
+  ansible.builtin.set_fact:
+    crosslink_wallet_address: >-
+      {{ (((wallet_address_rpc.json | default({})).result | default({})).address | default('', true))
+         or (wallet_address_log.stdout | default('') | regex_search('u[a-z0-9]{20,}') or '') }}
+
+- name: Check the wallet address is this chain's
+  ansible.builtin.assert:
+    that: crosslink_wallet_address is match('^(utest|u)1[a-z0-9]{20,}$')
+    fail_msg: >-
+      The wallet address read off {{ inventory_hostname }} is
+      "{{ crosslink_wallet_address }}", not a unified address. Nothing is
+      written for miner_address. Check the node's log for "USER WALLET
+      ADDRESS:" and run again.
+    quiet: true
+  when: crosslink_wallet_address | length > 0

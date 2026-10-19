@@ -1,0 +1,204 @@
+---
+# Wipes a node's chain state and lets it sync again, keeping its identity.
+#
+#   ansible-playbook -i inventory.yml reset.yml -l miner-1 -e reset_confirm=miner-1
+#
+# When to run it: the network has been replaced (a new genesis, a new magic, a
+# renamed state directory; the Nightly Network does this), or the state is
+# corrupt, or the node is on a fork of its own. A node whose state belongs to
+# a chain that no longer exists cannot sync and cannot be talked out of it.
+#
+# What it keeps: `secret.seed`. That file is the node's finalizer identity and
+# the wallet its mining rewards are paid to, and zebrad replaces a missing one
+# at random, so the reset moves it aside, wipes the state, and puts it back
+# under the season directory the build about to run expects. Nothing else on
+# the host is private: the chain resyncs.
+#
+# Every host is named explicitly. `reset_confirm` must equal the host being
+# reset, so a run with a wide limit stops rather than wiping a fleet.
+#
+# Order, when the network itself was replaced: run `site.yml` first. It builds
+# the new code and writes that build's chain parameters into the config; this
+# playbook then throws away the state that belonged to the old chain. The other
+# way round leaves the node syncing the new chain with the old parameters.
+#
+# Accept a new identity (no seed to keep): -e reset_new_identity=true
+
+- name: Preflight
+  hosts: all
+  become: false
+  gather_facts: true
+  roles:
+    - preflight
+
+- name: Check the reset is meant
+  hosts: node:miner:finalizer
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Refuse a reset that was not named
+      ansible.builtin.assert:
+        that: (reset_confirm | default('')) == inventory_hostname
+        fail_msg: >-
+          This wipes {{ inventory_hostname }}'s chain state. Name the host to
+          confirm: -e reset_confirm={{ inventory_hostname }}
+          {% if (reset_confirm | default('')) %}
+          (got "{{ reset_confirm }}").
+          {% endif %}
+        quiet: true
+
+- name: Reset the node
+  hosts: node:miner:finalizer
+  become: true
+  tags: [node]
+  tasks:
+    # zebrad keeps the seed inside the season directory under the data dir, so
+    # a wipe takes it with the chain unless it is moved out first. A host that
+    # has run two builds with different season directories can hold two: its
+    # own, and a random one zebrad wrote when it started without it. Picking
+    # one would be a guess, so copies of one seed are fine and two different
+    # seeds stop the reset — before anything is stopped or wiped.
+    - name: Find the seed
+      ansible.builtin.shell: >-
+        find {{ crosslink_data_dir | quote }} -maxdepth 3 -name secret.seed -type f 2>/dev/null | head -1
+      register: reset_seed_found
+      changed_when: false
+
+    - name: Count the different seeds
+      ansible.builtin.shell: >-
+        find {{ crosslink_data_dir | quote }} -maxdepth 3 -name secret.seed -type f
+        -exec sha256sum {} + 2>/dev/null | awk '{print $1}' | sort -u | wc -l
+      register: reset_seed_kinds
+      changed_when: false
+
+    - name: Refuse to choose between different seeds
+      ansible.builtin.assert:
+        that: (reset_seed_kinds.stdout | trim | int) <= 1
+        fail_msg: >-
+          {{ crosslink_data_dir }} holds {{ reset_seed_kinds.stdout | trim }}
+          different secret.seed files. Nothing was wiped. List them with
+          `sudo find {{ crosslink_data_dir }} -maxdepth 3 -name secret.seed -exec sha256sum {} +`,
+          keep the one whose fingerprint matches the key bundle, delete the
+          other, and re-run.
+        quiet: true
+
+    - name: Read its fingerprint
+      ansible.builtin.shell: sha256sum {{ reset_seed_found.stdout | quote }} | cut -c1-16
+      register: reset_seed_sum
+      changed_when: false
+      when: reset_seed_found.stdout | length > 0
+
+    - name: Refuse to wipe a host whose seed cannot be found
+      ansible.builtin.assert:
+        that: reset_seed_found.stdout | length > 0
+        fail_msg: >-
+          No secret.seed under {{ crosslink_data_dir }}. Wiping now would give
+          this host a new identity and a new payout wallet. Put the bundle's
+          seed back first ({{ crosslink_keys_dir }}/{{ inventory_hostname }}),
+          or accept a new identity with -e reset_new_identity=true
+        quiet: true
+      when: not (reset_new_identity | default(false) | bool)
+
+    - name: Stop the stake timer
+      ansible.builtin.systemd_service:
+        name: crosslink-stake.timer
+        state: stopped
+      failed_when: false
+
+    - name: Stop the node
+      ansible.builtin.systemd_service:
+        name: "{{ crosslink_service_name }}"
+        state: stopped
+
+    - name: Move the seed out of the way
+      ansible.builtin.copy:
+        src: "{{ reset_seed_found.stdout }}"
+        dest: "{{ crosslink_config_dir }}/secret.seed.kept"
+        remote_src: true
+        owner: root
+        group: "{{ crosslink_user }}"
+        mode: "0640"
+      when: reset_seed_found.stdout | length > 0
+
+    - name: Delete the chain state
+      ansible.builtin.file:
+        path: "{{ crosslink_data_dir }}"
+        state: absent
+
+    - name: Create the data directory
+      ansible.builtin.file:
+        path: "{{ crosslink_data_dir }}"
+        state: directory
+        owner: "{{ crosslink_user }}"
+        group: "{{ crosslink_user }}"
+        mode: "0750"
+
+    # The season directory is named in the release, appended to cache_dir at
+    # config load and never written back, so the name comes from the source
+    # this host is about to run — not from the path the old state used, which
+    # a release may have renamed.
+    - name: Read the season directory from the source
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        grep -oE '\.push\("[A-Za-z0-9_]+"\)' {{ crosslink_home }}/src/zebra-crosslink/zebrad/src/config.rs
+        | head -1 | sed -E 's/.*"(.*)".*/\1/'
+      args:
+        executable: /bin/bash
+      register: reset_season
+      changed_when: false
+      failed_when: false
+
+    - name: Put the seed back under the season directory
+      when:
+        - reset_seed_found.stdout | length > 0
+        - reset_season.stdout | length > 0
+      block:
+        - name: Create the season directory
+          ansible.builtin.file:
+            path: "{{ crosslink_data_dir }}/{{ reset_season.stdout | trim }}"
+            state: directory
+            owner: "{{ crosslink_user }}"
+            group: "{{ crosslink_user }}"
+            mode: "0750"
+
+        - name: Install the seed
+          ansible.builtin.copy:
+            src: "{{ crosslink_config_dir }}/secret.seed.kept"
+            dest: "{{ crosslink_data_dir }}/{{ reset_season.stdout | trim }}/secret.seed"
+            remote_src: true
+            owner: "{{ crosslink_user }}"
+            group: "{{ crosslink_user }}"
+            mode: "0600"
+
+    - name: Say what to do when the season directory could not be read
+      ansible.builtin.debug:
+        msg: >-
+          The season directory name is not in
+          {{ crosslink_home }}/src/zebra-crosslink/zebrad/src/config.rs, so the
+          seed was left at {{ crosslink_config_dir }}/secret.seed.kept. Start
+          the node, read the path from its log
+          ("getting key seed from"), stop it, copy the file there, start it
+          again — otherwise this host keeps the random seed zebrad just made.
+      when: reset_season.stdout | length == 0
+
+    - name: Start the node
+      ansible.builtin.systemd_service:
+        name: "{{ crosslink_service_name }}"
+        state: started
+
+    - name: Start the stake timer again
+      ansible.builtin.systemd_service:
+        name: crosslink-stake.timer
+        state: started
+      failed_when: false
+      when:
+        - not crosslink_disable_wallet | bool
+        - crosslink_autostake_to | length > 0
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: state wiped, syncing again.
+          Seed {{ reset_seed_sum.stdout | default('(new)', true) | trim }}
+          {{ 'kept at ' ~ crosslink_data_dir ~ '/' ~ (reset_season.stdout | trim) ~ '/secret.seed'
+             if (reset_season.stdout | length > 0) else 'left at ' ~ crosslink_config_dir ~ '/secret.seed.kept' }}.

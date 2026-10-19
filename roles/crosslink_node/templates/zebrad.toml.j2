@@ -1,0 +1,169 @@
+# Managed by Ansible (crosslink-ansible). Do not edit by hand.
+{% if crosslink_finalizer_enabled | bool %}
+# {{ 'Mining node.' if crosslink_mining_enabled | bool else 'Node.' }} Finalizer identity in its seed file. RPC on loopback.
+{% else %}
+# {{ 'Mining node.' if crosslink_mining_enabled | bool else 'RPC node.' }} No stake points at its key. RPC on loopback.
+{% endif %}
+# Network: {{ crosslink_network }}. The binary carries the chain. Its BFT and
+# state seed peers are not written here, so the node uses the ones compiled
+# into the build; its own table and its PoW seed peers are, read out of that
+# same binary at deploy time (see [network] below). A newer build rewrites
+# them on the next run. docs/zebrad-toml.md explains every key.
+
+[consensus]
+checkpoint_sync = true
+
+[crosslink]
+{% if crosslink_finalizer_enabled | bool %}
+# Address BFT peers dial. zebrad hashes it into its transport key: keep it
+# public and stable. No explicit_bft_key_seed: this node's finalizer key comes
+# from its seed file, which is the only copy of it.
+{% else %}
+# Address BFT peers dial. zebrad hashes it into its transport key: keep it
+# public and stable. No explicit_bft_key_seed: this node is not a finalizer.
+{% endif %}
+public_address = "{{ crosslink_public_address }}"
+disable_the_headless_wallet = {{ crosslink_disable_wallet | bool | lower }}
+disable_zaino = {{ crosslink_disable_zaino | bool | lower }}
+{% if crosslink_disable_shipped_hardforks | bool %}
+# The rules the binary ships are ignored; only the rules below apply.
+disable_shipped_hardforks = true
+{% endif %}
+{% for rule in crosslink_hardforks %}
+
+# Hard fork rule: burns at PoW {{ rule.pow_activation_height }}, new vote namespace from BFT {{ rule.bft_certificate_height }}.
+# Keys in zebrad.toml byte order. Read only at start. README.md, "Hard fork rules".
+[[crosslink.hardforks]]
+pow_activation_height = {{ rule.pow_activation_height }}
+bft_certificate_height = {{ rule.bft_certificate_height }}
+terminated_finalizers = [
+{% for key in rule.terminated_finalizers %}
+    "{{ key | lower }}",
+{% endfor %}
+]
+{% endfor %}
+
+{% if crosslink_mining_enabled | bool %}
+[mining]
+{% if crosslink_mining_hold | bool %}
+# Internal miner held off (crosslink_mining_hold) while the node replays a
+# restored state. Run site.yml without it once the node is at the tip.
+internal_miner = false
+{% else %}
+# Internal miner: solver threads and their priority.
+internal_miner = true
+internal_miner_threads = {{ crosslink_miner_threads | int }}
+internal_miner_low_priority = {{ crosslink_miner_low_priority | bool | lower }}
+{% endif %}
+{% if crosslink_miner_address %}
+miner_address = "{{ crosslink_miner_address }}"
+{% elif crosslink_miner_shielded | bool and crosslink_wallet_address | default('') %}
+# Rewards shielded (crosslink_miner_shielded): this wallet's own unified
+# address, read off the node. Every block pays one Ironwood note here, from
+# secret.seed as before. Back that file up. See README.md, "Rewards shielded".
+miner_address = "{{ crosslink_wallet_address }}"
+{% elif crosslink_miner_shielded | bool %}
+# Rewards shielded (crosslink_miner_shielded), but the node has not said its
+# wallet's unified address yet: this first start pays the transparent payout
+# address; the run reads the address once the wallet prints it and writes
+# this file again. See README.md, "Rewards shielded".
+{% else %}
+# No miner_address: rewards go to the node's own wallet, derived from
+# secret.seed. Back that file up. See README.md, "Mining".
+{% endif %}
+{% if crosslink_miner_extra_coinbase_data %}
+extra_coinbase_data = "{{ crosslink_miner_extra_coinbase_data }}"
+{% endif %}
+{% else %}
+# No [mining] section: this node does not mine. (The binary's own default
+# turns the internal miner on; the key below keeps it off.)
+[mining]
+internal_miner = false
+{% endif %}
+
+[network]
+cache_dir = "{{ crosslink_data_dir }}"
+listen_addr = "{{ crosslink_p2p_listen }}"
+{% if crosslink_p2p_external_addr %}
+external_addr = "{{ crosslink_p2p_external_addr }}"
+{% endif %}
+max_connections_per_ip = {{ crosslink_max_connections_per_ip | int }}
+peerset_initial_target_size = {{ crosslink_peerset_target | int }}
+# This chain, read out of the binary on this host at deploy time by
+# chain-params.py: its PoW seed peers, then the network's own table, copied
+# whole, with the checkpoint list turned off. The BFT and state peer lists
+# are left out on purpose, so the binary's own are used. The run checks this
+# file against the binary before the node starts.
+
+{{ crosslink_testnet_params }}
+
+{% if crosslink_chain.health_endpoint | default(false) | bool and crosslink_health_listen %}
+[health]
+# Loopback only. /healthy and /ready, for crosslink-check. A test network
+# answers /ready with 200 whatever its state unless this is enforced.
+listen_addr = "{{ crosslink_health_listen }}"
+enforce_on_test_networks = true
+
+{% endif %}
+{% if crosslink_metrics_listen %}
+[metrics]
+# zebrad's own Prometheus metrics (GET /metrics), for a scraper outside this
+# playbook. On in the inventory per host (crosslink_metrics_listen); the port
+# opens in ufw to crosslink_metrics_allow_from and to nobody else.
+endpoint_addr = "{{ crosslink_metrics_listen }}"
+
+{% endif %}
+{% if crosslink_mempool_tx_cost_limit | string | length > 0 %}
+[mempool]
+tx_cost_limit = {{ crosslink_mempool_tx_cost_limit | int }}
+
+{% endif %}
+{% if crosslink_block_notify_command %}
+[notify]
+# Run on every new best tip, %s = the block hash. Detached; never blocks validation.
+block_notify_command = "{{ crosslink_block_notify_command }}"
+
+{% endif %}
+[rpc]
+# Loopback only. The internal miner does not use this port.
+enable_cookie_auth = {{ crosslink_rpc_cookie_auth | bool | lower }}
+listen_addr = "{{ crosslink_rpc_listen }}"
+
+[state]
+cache_dir = "{{ crosslink_data_dir }}"
+# Removes old-format state directories only. secret.seed is not affected.
+delete_old_database = true
+network_local_port = {{ crosslink_bft_local_port }}
+# P2P identity. Unique per host.
+network_identity_seed_string = "{{ crosslink_identity_seed }}"
+{% if (crosslink_sync_download_concurrency | string) or (crosslink_sync_full_verify_concurrency | string) or (crosslink_sync_parallel_cpu_threads | string) %}
+
+[sync]
+{% if crosslink_sync_download_concurrency | string %}
+download_concurrency_limit = {{ crosslink_sync_download_concurrency | int }}
+{% endif %}
+{% if crosslink_sync_full_verify_concurrency | string %}
+full_verify_concurrency_limit = {{ crosslink_sync_full_verify_concurrency | int }}
+{% endif %}
+{% if crosslink_sync_parallel_cpu_threads | string %}
+parallel_cpu_threads = {{ crosslink_sync_parallel_cpu_threads | int }}
+{% endif %}
+{% endif %}
+{% if crosslink_log_filter or crosslink_log_file or (crosslink_log_use_journald | bool) %}
+
+[tracing]
+{% if crosslink_log_filter %}
+filter = "{{ crosslink_log_filter }}"
+{% endif %}
+{% if crosslink_log_file %}
+log_file = "{{ crosslink_log_file }}"
+{% endif %}
+{% if crosslink_log_use_journald | bool %}
+use_journald = true
+{% endif %}
+{% endif %}
+{% if crosslink_extra_toml %}
+
+# crosslink_extra_toml, verbatim:
+{{ crosslink_extra_toml }}
+{% endif %}

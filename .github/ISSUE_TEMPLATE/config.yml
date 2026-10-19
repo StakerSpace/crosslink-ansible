@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: A bug in the node software itself
+    url: https://github.com/ShieldedLabs/crosslink_monolith/issues
+    about: zebrad, the wallet, the BFT engine and the chain are Shielded Labs' work. Report them there; this repository only builds and runs them.
+  - name: Crosslink documentation and FAQ
+    url: https://shieldedlabs.net/crosslink/
+    about: What Crosslink is and how the Feature Net works.

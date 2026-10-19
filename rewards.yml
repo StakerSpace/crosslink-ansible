@@ -1,0 +1,26 @@
+---
+# What each miner has earned. Read-only: asks the node on every miner host
+# about its payout address and writes rewards.json to the key bundle.
+#
+#   ansible-playbook -i inventory.yml rewards.yml
+#   ansible-playbook -i inventory.yml rewards.yml -l miner-1
+#
+# The preflight runs first: the finalizer is never a target, here either.
+# site.yml does not read rewards; this playbook is the only place that does.
+
+- name: Preflight
+  hosts: miner
+  become: false
+  gather_facts: true
+  roles:
+    - preflight
+
+- name: Rewards
+  hosts: miner
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rewards
+      ansible.builtin.include_role:
+        name: node_identity
+        tasks_from: rewards

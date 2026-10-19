@@ -1,0 +1,293 @@
+---
+# Every setting, with its default. Override a setting per host in
+# inventory.yml, under the host, not under `all: vars:` (those rank below
+# this file). README.md explains the terms used below.
+
+# ─── Host roles ──────────────────────────────────────────────────────────────
+# A host's role comes from its inventory groups. Do not set these by hand.
+#   node       a full node: RPC on loopback, no mining
+#   miner      a full node with the internal miner on
+#   finalizer  a full node whose BFT key is meant to carry stake
+# A host can be in all three.
+#
+# The finalizer group changes no setting the node reads: every node derives a
+# BFT key from its seed file, and it becomes a finalizer when stake points at
+# that key. The group says so out loud, so the playbook copies the seed (which
+# IS the identity) to the key bundle, records the finalizer address stake is
+# sent to, and writes a host record that tells the truth. The playbook never
+# writes explicit_bft_key_seed. README.md, "Finalizer".
+crosslink_mining_enabled: "{{ inventory_hostname in (groups['miner'] | default([])) }}"
+crosslink_finalizer_enabled: "{{ inventory_hostname in (groups['finalizer'] | default([])) }}"
+
+# ─── Safety guard ────────────────────────────────────────────────────────────
+# Hosts the playbook must never touch, by inventory name or by hostname. List
+# every host that holds a finalizer identity this playbook did not install:
+# a restart costs it votes, a rebuild can cost it the identity.
+forbidden_hostnames: []
+#  - my-hand-built-finalizer
+
+# The playbook also refuses any host where zebrad is already running.
+# Set true only if that zebrad was installed by this playbook.
+allow_existing_zebrad: false
+
+# ─── Storage ─────────────────────────────────────────────────────────────────
+# A volume for the chain state. Set per host in the inventory. Empty = the
+# default path (/var/lib/crosslink). The state is written to
+# <crosslink_data_root>/node.
+#   crosslink_data_root: /mnt/ssd/crosslink
+# `bulk_data_root` is another name for the same setting.
+bulk_data_root: ""
+crosslink_data_root: "{{ bulk_data_root }}"
+
+# ─── Which network ───────────────────────────────────────────────────────────
+# A host joins one network. The name picks a row of crosslink_chains below:
+# which code is built and the staking calendar the two host scripts read.
+#
+#   featurenet      The Feature Net (default): Shielded Labs' public test
+#                   network, v15 since 2026-10-13. The binary carries the
+#                   chain (its magic, genesis, seed peers and parameters), so
+#                   nothing about the chain is typed here: the node role reads
+#                   the chain's table back out of the binary it installed.
+#   featurenet-v14  Another name for the same row; prefer `featurenet`.
+#   nightly         The Nightly Network: Shielded Labs' fast-moving test
+#                   chain, built from `dev`, replaced whenever they want a new
+#                   one. Same mechanism: the binary carries the chain.
+#
+# A host on another network sets the name in the inventory and nothing else:
+#   crosslink_network: nightly
+crosslink_network: featurenet
+
+# One row per network. `ref` is the code built unless crosslink_ref says
+# otherwise. The calendar (period, window, the first block a stake is valid
+# at, the block finality starts at, the roster cap) is written to
+# /etc/crosslink/chain.env on every node host for crosslink-check and
+# crosslink-stake. Read the values in the source of the build a host runs
+# (librustzcash/zcash_primitives/src/bft.rs, PROTOTYPE_PARAMETERS); they are
+# test parameters and they move between networks.
+crosslink_chains:
+  featurenet:
+    ref: "v15"
+    staking_period_blocks: 10368
+    staking_window_blocks: 3456
+    # STAKING_ACTION_DELAY (window + 1): an unstake waits this many blocks
+    # from its stake, a withdraw from its unstake
+    staking_action_delay_blocks: 3457
+    # BftBootstrap::FromChain: no staking action is valid below the first,
+    # the stakes at the second choose the first finalizers, finality starts
+    # at the third
+    staking_start_block: 20736
+    roster_block: 34560
+    activation_block: 36288
+    # the largest N finalizers by stake vote; the rest sign nothing
+    active_roster_max: 12
+    # the build has the [health] section (zebrad/src/components/health.rs)
+    health_endpoint: true
+    # 25 s target. Only scales "closes in N blocks" into minutes.
+    blocks_per_minute: 2.4
+  nightly:
+    ref: "dev"
+    staking_period_blocks: 150
+    staking_window_blocks: 70
+    staking_action_delay_blocks: 75
+    staking_start_block: 0
+    roster_block: 75
+    activation_block: 275
+    active_roster_max: 3
+    health_endpoint: true
+    blocks_per_minute: 2.4
+# The row for this host. `featurenet-v14` is another name for `featurenet`.
+crosslink_chain: >-
+  {{ crosslink_chains[('featurenet' if crosslink_network == 'featurenet-v14' else crosslink_network)] }}
+
+# ─── Source ──────────────────────────────────────────────────────────────────
+crosslink_repo: "https://github.com/ShieldedLabs/crosslink_monolith.git"
+
+# Git ref to deploy: a tag (v15), a branch (main) or a commit sha.
+# A branch is re-fetched and rebuilt on every run if its head moved.
+# The default follows the network (crosslink_chains above).
+crosslink_ref: "{{ crosslink_tag }}"
+crosslink_tag: "{{ crosslink_chain.ref }}"   # another name for crosslink_ref
+
+# false = never fetch again; keep the checkout the host already has.
+crosslink_update_source: true
+
+# build = fetch and build on the host (about 20 min cold)
+# copy  = upload zebrad_local_binary from the control machine
+zebrad_install_mode: build
+zebrad_local_binary: ""
+
+# ─── Hard fork rules ────────────────────────────────────────────────────────
+# A user-led hard fork rule terminates finalizers: at its PoW height every
+# bond pointing at them is burned, and from its BFT height votes are signed
+# under a new namespace. Every node on the network must carry the rule, or it
+# leaves the network at the PoW height and carries on alone, with a tip that
+# still climbs. README.md, "Hard fork rules".
+#
+# Load a rule well before its PoW height. The node reads its config only at
+# start, and a node that has already written the PoW height to disk without
+# the burn stays wrong after a restart: rebuild its state from a snapshot
+# (restore.yml). The node role refuses to add a rule to a node whose tip is
+# within crosslink_hardfork_margin blocks of the rule's PoW height.
+#
+# Keys as zebrad.toml writes them. Copy a published rule exactly.
+#   - pow_activation_height: 228096
+#     bft_certificate_height: 2158
+#     terminated_finalizers:
+#       - "<64 hex characters>"
+crosslink_hardforks: []
+
+# The rules the binary ships are applied by zebrad itself and are not written
+# here. true = ignore them and run only crosslink_hardforks (a test-network
+# operator writing the whole schedule by hand). Leave false on a public chain.
+crosslink_disable_shipped_hardforks: false
+
+# Blocks before a new rule's PoW height after which the node role will not
+# add it.
+crosslink_hardfork_margin: 600
+
+# ─── Node ────────────────────────────────────────────────────────────────────
+crosslink_user: crosslink
+crosslink_home: /opt/crosslink          # bin/, src/, .cargo/
+crosslink_config_dir: /etc/crosslink
+crosslink_data_dir: "{{ (crosslink_data_root ~ '/node') if crosslink_data_root else '/var/lib/crosslink' }}"
+
+# systemd unit name.
+crosslink_service_name: crosslink-node
+
+# Ports. p2p and BFT face the internet. RPC stays on loopback.
+crosslink_p2p_listen: "[::]:8233"        # [network] listen_addr
+crosslink_bft_local_port: 12001          # [state] network_local_port: state network, TCP + UDP
+crosslink_bft_overlay_port: 12301        # [crosslink] public_address port: tenderlink overlay, UDP
+crosslink_rpc_listen: "127.0.0.1:8232"   # [rpc] listen_addr
+# true = the RPC asks for the cookie in [rpc] cookie_dir (zebra's default).
+# Off here because the host scripts and curl on loopback would need it.
+crosslink_rpc_cookie_auth: false
+# The node's own health server, where the build has one (crosslink_chains,
+# `health_endpoint`): GET /healthy is 200 with a live PoW peer, GET /ready is
+# 200 at the tip and 503 with the reason ("syncing", "lag=N blocks",
+# "tip_age=Ns"). Loopback only. Empty turns it off.
+crosslink_health_listen: "127.0.0.1:8234"
+
+# Address BFT peers use to reach this node, "ip:port". Must be public and
+# stable: zebrad hashes it into the node's transport key. The default is the
+# host's first IPv4 address. Behind NAT: set crosslink_public_ip per host and
+# forward the UDP port.
+crosslink_public_ip: "{{ ansible_default_ipv4.address | default('') }}"
+crosslink_public_address: "{{ crosslink_public_ip }}:{{ crosslink_bft_overlay_port }}"
+
+# [network] external_addr: the p2p address to advertise when the node is
+# behind NAT or a load balancer and listen_addr is not reachable. Empty = not
+# written (zebra's default).
+crosslink_p2p_external_addr: ""
+
+# [network] peerset_initial_target_size and max_connections_per_ip.
+crosslink_peerset_target: 25
+crosslink_max_connections_per_ip: 1
+
+# true = keep a miner's config but with its internal miner off. For a miner
+# replaying a restored state: a miner that mines before it is back on the
+# network's chain mines on its own branch. README.md, "Restore".
+crosslink_mining_hold: false
+
+# The headless wallet and Zaino (the light wallet server) stay off. Turn the
+# wallet on, per host in the inventory, only to stake from the host itself.
+# The playbook never sets explicit_bft_key_seed.
+crosslink_disable_wallet: true
+crosslink_disable_zaino: true
+
+# The stake timer. Set crosslink_autostake_to to a finalizer address (zfinv1…)
+# on a host with the wallet on, in the inventory: the run installs the timer of
+# crosslink-stake, which stakes the host's rewards to it. Empty removes the
+# timer. The playbook never stakes; the timer on the host does.
+crosslink_autostake_to: ""
+crosslink_autostake_min: 10             # cTAZ gathered before a pass stakes
+# A pass that finds nothing to do ends in seconds. Longer than this delays the
+# first stake after Staking Day opens, and the last before it closes, by as much.
+crosslink_autostake_every_minutes: 30
+crosslink_autostake_dry_run: false      # true = every check, nothing sent
+crosslink_autostake_reference: ""       # an explorer's tip URL for the fork check
+
+# Open the node's ports in ufw if ufw is active. Mining needs no extra port.
+manage_ufw: true
+
+# The node's state-network identity ([state] network_identity_seed_string):
+# blake3 of this string is the key seed, so the same string is the same
+# identity on any machine, forever. There is no default: set a random string
+# per host in the inventory, keep it private, and keep it once chosen.
+#   openssl rand -hex 16
+# Not the BFT identity and not the wallet; those are the seed file. The
+# preflight refuses an empty value, the placeholder and the documented example.
+crosslink_identity_seed: ""
+
+# ─── Mining (miner group only) ───────────────────────────────────────────────
+# Payout address. Empty = derived from the host's seed file. See README.md,
+# "Mining".
+crosslink_miner_address: ""
+
+# true = the rewards go to this node's own wallet shielded: miner_address is
+# set to the wallet's own unified address, read off the node, and every block
+# pays one Ironwood note there instead of a transparent coin to the payout
+# address. Needs the wallet on (crosslink_disable_wallet: false) and no
+# crosslink_miner_address. A stake from such a wallet spends those notes, so
+# the chain shows no address it was paid from. README.md, "Rewards shielded".
+crosslink_miner_shielded: false
+
+# Text stamped into each coinbase. Public and permanent. Max about 95 bytes.
+crosslink_miner_extra_coinbase_data: ""
+
+# Parallel equihash solvers ([mining] internal_miner_threads). Each one is a
+# thread on its own nonce range, one core and 144 MB; the node clamps it to
+# the host's cores. Blocks arrive about N times as often. One is upstream's
+# default; a miner with cores to spare sets it per host (leave two cores to
+# the node itself).
+crosslink_miner_threads: 1
+# Solvers at the lowest OS priority ([mining] internal_miner_low_priority).
+# Costs nothing on idle cores; on a saturated host it keeps mining from
+# starving consensus and the network, which is what a node is for.
+crosslink_miner_low_priority: true
+
+# Blocks after which a coinbase output can be spent. The Feature Net sets
+# MIN_TRANSPARENT_COINBASE_MATURITY to 2 (zebra-chain/src/transparent.rs;
+# Zcash: 100). Only the rewards check reads it, for its "immature" figure.
+crosslink_coinbase_maturity: 2
+
+# ─── Sync, mempool, logging ──────────────────────────────────────────────────
+# zebrad's own tunables, written only when they differ from empty. The
+# defaults are zebra's; docs/zebrad-toml.md says what each one does.
+# [sync]
+crosslink_sync_download_concurrency: ""        # default 50
+crosslink_sync_full_verify_concurrency: ""     # default 20
+crosslink_sync_parallel_cpu_threads: ""        # default 0 = every core
+# [mempool]
+crosslink_mempool_tx_cost_limit: ""            # default 80000000
+# [tracing]
+crosslink_log_filter: ""                       # e.g. "info,zebra_network=debug"
+crosslink_log_file: ""                         # a path; empty = the journal
+crosslink_log_use_journald: false              # true = structured journald fields
+# [notify]
+crosslink_block_notify_command: ""             # e.g. "/usr/local/bin/on-block %s"
+
+# Anything else, verbatim, at the end of zebrad.toml: a section the template
+# does not write (docs/zebrad-toml.md lists which it writes). Multi-line.
+#   crosslink_extra_toml: |
+#     [zcashd_compat]
+#     enabled = false
+crosslink_extra_toml: ""
+
+# ─── Metrics ─────────────────────────────────────────────────────────────────
+# zebrad's own Prometheus endpoint (GET /metrics), for a Prometheus and
+# Grafana stack kept outside this playbook. Off unless the inventory sets a
+# bind address for the host; then the port opens in ufw to the scrapers'
+# addresses listed and to nobody else. Setting it changes zebrad.toml, so
+# the node restarts once. README.md, "Metrics".
+#
+#   miner-1:
+#     crosslink_metrics_listen: "0.0.0.0:9999"
+#     crosslink_metrics_allow_from: ["203.0.113.5"]
+crosslink_metrics_listen: ""
+crosslink_metrics_allow_from: []
+
+# ─── Key bundle ──────────────────────────────────────────────────────────────
+# Where each node's seed and record are written, on the control machine.
+# Must be outside the repository. See README.md, "Key bundle".
+crosslink_keys_dir: "{{ lookup('env', 'HOME') }}/crosslink-node-keys"

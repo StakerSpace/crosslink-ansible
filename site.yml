@@ -1,0 +1,43 @@
+---
+# Deploys Crosslink nodes: RPC nodes, miners and finalizers, from the official
+# node software (ShieldedLabs/crosslink_monolith). A host's role is its
+# inventory group: node, miner, finalizer. See README.md.
+#
+# Rule: a host that already runs a node is never a target. The preflight play
+# refuses hosts on forbidden_hostnames and hosts already running zebrad. A host
+# in the `finalizer` group is one this playbook installed and owns.
+#
+# Tags: node, identity. Preflight always runs. `stake` is the part of node
+# that installs crosslink-stake, its timer, crosslink-check and chain.env, and
+# nothing else: no build, no config, no restart.
+# Limit: `-l miner` deploys the miners and nothing else.
+
+- name: Preflight
+  hosts: all
+  become: false
+  gather_facts: true
+  tags: [always]
+  roles:
+    - preflight
+
+- name: Nodes
+  hosts: node:miner:finalizer
+  become: true
+  tags: [node]
+  roles:
+    - crosslink_node
+
+# Own play so the node has restarted with the new config before it is asked
+# about itself.
+- name: Identity and keys
+  hosts: node:miner:finalizer
+  become: true
+  tags: [identity]
+  roles:
+    - node_identity
+  tasks:
+    - name: Write fleet index
+      ansible.builtin.include_role:
+        name: node_identity
+        tasks_from: fleet
+      run_once: true

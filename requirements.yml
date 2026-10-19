@@ -1,0 +1,5 @@
+---
+# Collections the playbooks use beyond ansible.builtin.
+#   ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: community.general   # community.general.ufw
